@@ -8,8 +8,8 @@
 #include <stdint.h>
 
 #define APP_MAX_PAGES 9u
-#define APP_DEFAULT_WIDTH 80
-#define APP_DEFAULT_HEIGHT 24
+#define APP_DEFAULT_WIDTH 120
+#define APP_DEFAULT_HEIGHT 36
 #define APP_DEFAULT_FPS 30u
 #define APP_FOOTER_HEIGHT 1
 
