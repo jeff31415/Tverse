@@ -166,6 +166,12 @@ drawing helpers when they need boxes, fills or specialized clipping.
 6. Page destruction runs in reverse registration order.
 7. TUI is restored after all page-owned resources have been released.
 
+For F2, `CanvasPage` owns a `CanvasState`; that state owns both its pending
+sample allocation and the linked operation history. `CanvasRenderTarget`
+temporarily borrows `Page.frame.cells` during rendering and does not free or
+retain it. See [Reusable canvas state](canvas-state.md) for the complete nested
+ownership and lifecycle contract.
+
 The default registration table is in [`pages.c`](../pages.c). F2 installs the
 Canvas callbacks; the other pages currently use the no-op placeholder
 callbacks.

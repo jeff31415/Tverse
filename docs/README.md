@@ -9,6 +9,7 @@ an application-level page lifecycle, and an implemented Canvas page on F2.
 | Document | Contents |
 | --- | --- |
 | [Application lifecycle](application-lifecycle.md) | Main loop, page switching, ownership, principal structures and application functions |
+| [Reusable canvas state](canvas-state.md) | Page-independent stroke lifecycle, history ownership, projection, rendering and reuse contract |
 | [Canvas page](pages/canvas.md) | F2 layout, input flow, coordinate system, operation history, rendering and page functions |
 
 The original Canvas design material is under
@@ -63,10 +64,15 @@ shortcuts:
   helpers.
 - [`canvas.h`](../canvas.h) and [`canvas.c`](../canvas.c): centered document
   coordinates and operation history.
+- [`canvas_state.h`](../canvas_state.h) and
+  [`canvas_state.c`](../canvas_state.c): reusable pending-stroke lifecycle,
+  interpolation, undo/redo facade, viewport projection and cell-buffer
+  rendering.
 - [`canvas_page.h`](../canvas_page.h) and
-  [`canvas_page.c`](../canvas_page.c): F2 input, layout, palette and rendering.
+  [`canvas_page.c`](../canvas_page.c): F2 input, layout, palette and page chrome.
 - [`pages.c`](../pages.c): page registration and placeholder pages.
-- [`canvas_test.c`](../canvas_test.c): document bounds and history tests.
+- [`canvas_test.c`](../canvas_test.c): document history, state, projection and
+  rendering tests.
 - [`draw_app.conf.example`](../draw_app.conf.example): complete optional
   configuration example.
 

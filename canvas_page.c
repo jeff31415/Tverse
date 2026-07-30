@@ -1,6 +1,6 @@
 #include "canvas_page.h"
 
-#include "canvas.h"
+#include "canvas_state.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -49,30 +49,16 @@ typedef struct CanvasLayout {
     int palette_visible_rows;
 } CanvasLayout;
 
-typedef struct CanvasStroke {
-    bool active;
-    unsigned char ch;
-    CanvasSample *samples;
-    size_t sample_count;
-    size_t sample_capacity;
-} CanvasStroke;
-
 struct CanvasPage {
-    CanvasDocument document;
+    CanvasState canvas;
     CanvasPalette palette;
     CanvasLayout layout;
-    CanvasStroke stroke;
     TgVec2i last_mouse_world;
     bool last_mouse_on_canvas;
     bool layout_dirty;
     bool frame_dirty;
     char status[96];
 };
-
-typedef struct CanvasReplayContext {
-    CanvasPage *state;
-    AppFrame *frame;
-} CanvasReplayContext;
 
 static bool canvas_rect_contains(TgRecti rect, int x, int y)
 {
@@ -363,53 +349,12 @@ static void canvas_layout_compute(CanvasPage *state, TgSizei frame_size)
     state->frame_dirty = true;
 }
 
-static bool canvas_screen_to_world(
-    const CanvasPage *state,
-    int screen_x,
-    int screen_y,
-    TgVec2i *out_position)
+static CanvasViewport canvas_page_viewport(const CanvasPage *state)
 {
-    if (state == NULL ||
-        out_position == NULL ||
-        !canvas_rect_contains(
-            state->layout.canvas_view,
-            screen_x,
-            screen_y)) {
-        return false;
-    }
-
-    out_position->x = screen_x - state->layout.origin_screen.x;
-    out_position->y = screen_y - state->layout.origin_screen.y;
-    return true;
-}
-
-static bool canvas_world_to_screen(
-    const CanvasPage *state,
-    TgVec2i position,
-    TgVec2i *out_screen)
-{
-    if (state == NULL || out_screen == NULL) {
-        return false;
-    }
-
-    int64_t screen_x =
-        (int64_t)state->layout.origin_screen.x + position.x;
-    int64_t screen_y =
-        (int64_t)state->layout.origin_screen.y + position.y;
-    if (screen_x < INT32_MIN ||
-        screen_x > INT32_MAX ||
-        screen_y < INT32_MIN ||
-        screen_y > INT32_MAX ||
-        !canvas_rect_contains(
-            state->layout.canvas_view,
-            (int)screen_x,
-            (int)screen_y)) {
-        return false;
-    }
-
-    out_screen->x = (int32_t)screen_x;
-    out_screen->y = (int32_t)screen_y;
-    return true;
+    return (CanvasViewport){
+        .rect = state->layout.canvas_view,
+        .origin_screen = state->layout.origin_screen,
+    };
 }
 
 static int canvas_palette_total_rows(const CanvasPage *state)
@@ -513,151 +458,19 @@ static bool canvas_palette_hit(
     return true;
 }
 
-static TgResult canvas_stroke_reserve(
-    CanvasStroke *stroke,
-    size_t required)
+static TgResult canvas_page_finalize_stroke(CanvasPage *state)
 {
-    if (required <= stroke->sample_capacity) {
-        return TG_OK;
-    }
-
-    size_t capacity =
-        stroke->sample_capacity == 0 ? 32u : stroke->sample_capacity;
-    while (capacity < required) {
-        if (capacity > SIZE_MAX / 2u) {
-            return TG_ERR_NOMEM;
-        }
-        capacity *= 2u;
-    }
-    if (capacity > SIZE_MAX / sizeof(*stroke->samples)) {
-        return TG_ERR_NOMEM;
-    }
-
-    CanvasSample *samples =
-        realloc(stroke->samples, capacity * sizeof(*samples));
-    if (samples == NULL) {
-        return TG_ERR_NOMEM;
-    }
-
-    stroke->samples = samples;
-    stroke->sample_capacity = capacity;
-    return TG_OK;
-}
-
-static TgResult canvas_stroke_append_raw(
-    CanvasStroke *stroke,
-    TgVec2i position)
-{
-    if (stroke->sample_count > 0) {
-        CanvasSample *last = &stroke->samples[stroke->sample_count - 1u];
-        if (last->position.x == position.x &&
-            last->position.y == position.y) {
-            return TG_OK;
-        }
-    }
-
-    TgResult result =
-        canvas_stroke_reserve(stroke, stroke->sample_count + 1u);
-    if (tg_result_err(result)) {
-        return result;
-    }
-
-    CanvasSample sample;
-    memset(&sample, 0, sizeof(sample));
-    sample.position = position;
-    sample.cell.ch[0] = (char)stroke->ch;
-    sample.cell.width = 1;
-    sample.cell.fg = TUI_COLOR_DEFAULT;
-    sample.cell.bg = TUI_COLOR_DEFAULT;
-    sample.cell.style = TUI_STYLE_NONE;
-    stroke->samples[stroke->sample_count++] = sample;
-    return TG_OK;
-}
-
-static TgResult canvas_stroke_append(
-    CanvasStroke *stroke,
-    TgVec2i position)
-{
-    if (stroke->sample_count == 0) {
-        return canvas_stroke_append_raw(stroke, position);
-    }
-
-    TgVec2i last = stroke->samples[stroke->sample_count - 1u].position;
-    int x = last.x;
-    int y = last.y;
-    int dx = position.x > x ? position.x - x : x - position.x;
-    int sx = x < position.x ? 1 : -1;
-    int dy_abs = position.y > y ? position.y - y : y - position.y;
-    int dy = -dy_abs;
-    int sy = y < position.y ? 1 : -1;
-    int error = dx + dy;
-
-    while (x != position.x || y != position.y) {
-        int twice_error = error * 2;
-        if (twice_error >= dy) {
-            error += dy;
-            x += sx;
-        }
-        if (twice_error <= dx) {
-            error += dx;
-            y += sy;
-        }
-
-        TgResult result = canvas_stroke_append_raw(
-            stroke,
-            (TgVec2i){x, y});
-        if (tg_result_err(result)) {
-            return result;
-        }
-    }
-    return TG_OK;
-}
-
-static TgResult canvas_stroke_begin(
-    CanvasPage *state,
-    TgVec2i position)
-{
-    state->stroke.active = true;
-    state->stroke.ch = canvas_palette_selected(state);
-    state->stroke.sample_count = 0;
-    TgResult result = canvas_stroke_append(&state->stroke, position);
-    if (tg_result_ok(result)) {
+    bool active = canvas_state_stroke_active(&state->canvas);
+    TgResult result = canvas_state_finalize_stroke(&state->canvas);
+    if (tg_result_ok(result) && active) {
         state->frame_dirty = true;
     }
     return result;
 }
 
-static TgResult canvas_stroke_finalize(CanvasPage *state)
-{
-    if (!state->stroke.active) {
-        return TG_OK;
-    }
-
-    TgResult result = canvas_document_commit_draw(
-        &state->document,
-        state->stroke.samples,
-        state->stroke.sample_count);
-    if (tg_result_err(result)) {
-        return result;
-    }
-
-    state->stroke.active = false;
-    state->stroke.sample_count = 0;
-    state->frame_dirty = true;
-    return TG_OK;
-}
-
-static void canvas_stroke_cancel(CanvasPage *state)
-{
-    state->stroke.active = false;
-    state->stroke.sample_count = 0;
-    state->frame_dirty = true;
-}
-
 static TgResult canvas_page_new_document(CanvasPage *state)
 {
-    canvas_stroke_cancel(state);
-    canvas_document_reset(&state->document);
+    canvas_state_reset(&state->canvas);
     (void)snprintf(
         state->status,
         sizeof(state->status),
@@ -668,11 +481,14 @@ static TgResult canvas_page_new_document(CanvasPage *state)
 
 static TgResult canvas_page_undo(CanvasPage *state)
 {
-    TgResult result = canvas_stroke_finalize(state);
+    bool changed =
+        canvas_state_stroke_active(&state->canvas) ||
+        canvas_state_can_undo(&state->canvas);
+    TgResult result = canvas_state_undo(&state->canvas);
     if (tg_result_err(result)) {
         return result;
     }
-    if (canvas_document_undo(&state->document)) {
+    if (changed) {
         (void)snprintf(state->status, sizeof(state->status), "Undo");
         state->frame_dirty = true;
     }
@@ -681,12 +497,16 @@ static TgResult canvas_page_undo(CanvasPage *state)
 
 static TgResult canvas_page_redo(CanvasPage *state)
 {
-    TgResult result = canvas_stroke_finalize(state);
+    bool pending = canvas_state_stroke_active(&state->canvas);
+    bool changed = canvas_state_can_redo(&state->canvas);
+    TgResult result = canvas_state_redo(&state->canvas);
     if (tg_result_err(result)) {
         return result;
     }
-    if (canvas_document_redo(&state->document)) {
+    if (changed) {
         (void)snprintf(state->status, sizeof(state->status), "Redo");
+    }
+    if (pending || changed) {
         state->frame_dirty = true;
     }
     return TG_OK;
@@ -741,7 +561,7 @@ static TgResult canvas_page_handle_mouse(
                 mouse->x,
                 mouse->y,
                 &palette_index)) {
-            TgResult result = canvas_stroke_finalize(state);
+            TgResult result = canvas_page_finalize_stroke(state);
             if (tg_result_err(result)) {
                 return result;
             }
@@ -763,29 +583,45 @@ static TgResult canvas_page_handle_mouse(
         }
 
         TgVec2i position;
-        if (canvas_screen_to_world(
-                state,
+        CanvasViewport viewport = canvas_page_viewport(state);
+        if (canvas_viewport_screen_to_world(
+                &viewport,
                 mouse->x,
                 mouse->y,
                 &position)) {
             state->last_mouse_world = position;
             state->last_mouse_on_canvas = true;
-            return canvas_stroke_begin(state, position);
+            TuiCell cell = canvas_cell(
+                canvas_palette_selected(state),
+                TUI_COLOR_DEFAULT,
+                TUI_COLOR_DEFAULT,
+                TUI_STYLE_NONE);
+            TgResult result = canvas_state_begin_stroke(
+                &state->canvas,
+                position,
+                cell);
+            if (tg_result_ok(result)) {
+                state->frame_dirty = true;
+            }
+            return result;
         }
         return TG_OK;
     }
 
-    if (mouse->action == TUI_MOUSE_DRAG && state->stroke.active) {
+    if (mouse->action == TUI_MOUSE_DRAG &&
+        canvas_state_stroke_active(&state->canvas)) {
         TgVec2i position;
-        if (canvas_screen_to_world(
-                state,
+        CanvasViewport viewport = canvas_page_viewport(state);
+        if (canvas_viewport_screen_to_world(
+                &viewport,
                 mouse->x,
                 mouse->y,
                 &position)) {
             state->last_mouse_world = position;
             state->last_mouse_on_canvas = true;
-            TgResult result =
-                canvas_stroke_append(&state->stroke, position);
+            TgResult result = canvas_state_append_stroke(
+                &state->canvas,
+                position);
             if (tg_result_ok(result)) {
                 state->frame_dirty = true;
             }
@@ -796,7 +632,7 @@ static TgResult canvas_page_handle_mouse(
     }
 
     if (mouse->action == TUI_MOUSE_RELEASE) {
-        return canvas_stroke_finalize(state);
+        return canvas_page_finalize_stroke(state);
     }
     return TG_OK;
 }
@@ -822,7 +658,7 @@ static TgResult canvas_page_on_leave(
     if (page == NULL || page->userdata == NULL) {
         return TG_ERR_INVALID;
     }
-    return canvas_stroke_finalize(page->userdata);
+    return canvas_page_finalize_stroke(page->userdata);
 }
 
 static TgResult canvas_page_handle_event(
@@ -855,7 +691,7 @@ static TgResult canvas_page_handle_event(
     if (event->type == TUI_INPUT_TEXT &&
         event->ch >= CANVAS_PALETTE_FIRST &&
         event->ch <= CANVAS_PALETTE_LAST) {
-        TgResult result = canvas_stroke_finalize(state);
+        TgResult result = canvas_page_finalize_stroke(state);
         if (tg_result_err(result)) {
             return result;
         }
@@ -888,80 +724,23 @@ static TgResult canvas_page_update(
     return TG_OK;
 }
 
-static void canvas_page_draw_sample(
-    const CanvasSample *sample,
-    void *userdata)
-{
-    CanvasReplayContext *context = userdata;
-    TgVec2i screen;
-    if (!canvas_world_to_screen(
-            context->state,
-            sample->position,
-            &screen)) {
-        return;
-    }
-
-    uint32_t bg = canvas_document_contains_output(
-        &context->state->document,
-        sample->position)
-        ? CANVAS_COLOR_OUTPUT_BG
-        : CANVAS_COLOR_DRAFT_BG;
-    uint32_t fg = sample->cell.fg == TUI_COLOR_DEFAULT
-        ? CANVAS_COLOR_TEXT
-        : sample->cell.fg;
-    if (sample->cell.bg != TUI_COLOR_DEFAULT) {
-        bg = sample->cell.bg;
-    }
-    canvas_frame_put(
-        context->frame,
-        screen.x,
-        screen.y,
-        (unsigned char)sample->cell.ch[0],
-        fg,
-        bg,
-        sample->cell.style);
-}
-
-static void canvas_page_draw_canvas(
+static TgResult canvas_page_draw_canvas(
     CanvasPage *state,
     AppFrame *frame)
 {
     canvas_frame_box(frame, state->layout.canvas_panel, "Canvas");
 
-    TgRecti view = state->layout.canvas_view;
-    for (int y = view.y; y < view.y + view.h; ++y) {
-        for (int x = view.x; x < view.x + view.w; ++x) {
-            TgVec2i position = {
-                x - state->layout.origin_screen.x,
-                y - state->layout.origin_screen.y,
-            };
-            uint32_t bg = canvas_document_contains_output(
-                &state->document,
-                position)
-                ? CANVAS_COLOR_OUTPUT_BG
-                : CANVAS_COLOR_DRAFT_BG;
-            canvas_frame_put(
-                frame,
-                x,
-                y,
-                ' ',
-                CANVAS_COLOR_TEXT,
-                bg,
-                TUI_STYLE_NONE);
-        }
-    }
-
-    CanvasReplayContext context = {
-        .state = state,
-        .frame = frame,
+    CanvasRenderTarget target = {
+        .size = frame->size,
+        .cells = frame->cells,
+        .viewport = canvas_page_viewport(state),
+        .style = {
+            .default_fg = CANVAS_COLOR_TEXT,
+            .draft_bg = CANVAS_COLOR_DRAFT_BG,
+            .output_bg = CANVAS_COLOR_OUTPUT_BG,
+        },
     };
-    canvas_document_replay(
-        &state->document,
-        canvas_page_draw_sample,
-        &context);
-    for (size_t i = 0; i < state->stroke.sample_count; ++i) {
-        canvas_page_draw_sample(&state->stroke.samples[i], &context);
-    }
+    return canvas_state_render(&state->canvas, &target);
 }
 
 static void canvas_page_draw_toolbox(
@@ -1094,13 +873,13 @@ static void canvas_page_draw_toolbar(
         frame,
         CANVAS_BUTTON_UNDO,
         "Undo",
-        canvas_document_can_undo(&state->document));
+        canvas_state_can_undo(&state->canvas));
     canvas_page_draw_button(
         state,
         frame,
         CANVAS_BUTTON_REDO,
         "Redo",
-        canvas_document_can_redo(&state->document));
+        canvas_state_can_redo(&state->canvas));
 
     int status_x = state->layout.buttons[CANVAS_BUTTON_REDO].x +
                    state->layout.buttons[CANVAS_BUTTON_REDO].w + 1;
@@ -1134,7 +913,10 @@ static TgResult canvas_page_render(Page *page)
         CANVAS_COLOR_PAGE_BG,
         TUI_STYLE_NONE);
     canvas_page_draw_toolbox(state, &page->frame);
-    canvas_page_draw_canvas(state, &page->frame);
+    TgResult result = canvas_page_draw_canvas(state, &page->frame);
+    if (tg_result_err(result)) {
+        return result;
+    }
     canvas_page_draw_palette(state, &page->frame);
     canvas_page_draw_toolbar(state, &page->frame);
     state->frame_dirty = false;
@@ -1148,9 +930,7 @@ static void canvas_page_destroy(Page *page)
     }
 
     CanvasPage *state = page->userdata;
-    free(state->stroke.samples);
-    state->stroke.samples = NULL;
-    canvas_document_destroy(&state->document);
+    canvas_state_destroy(&state->canvas);
     free(state);
     page->userdata = NULL;
 }
@@ -1169,8 +949,7 @@ TgResult canvas_page_create(
         return TG_ERR_NOMEM;
     }
 
-    TgResult result =
-        canvas_document_init(&state->document, output_size);
+    TgResult result = canvas_state_init(&state->canvas, output_size);
     if (tg_result_err(result)) {
         free(state);
         return result;

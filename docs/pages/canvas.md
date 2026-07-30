@@ -2,8 +2,13 @@
 
 The Canvas page is the first implemented `draw_app` page. Its public creation
 interface is in [`canvas_page.h`](../../canvas_page.h), its controller and
-renderer are in [`canvas_page.c`](../../canvas_page.c), and its document model
-is in [`canvas.h`](../../canvas.h) and [`canvas.c`](../../canvas.c).
+page chrome are in [`canvas_page.c`](../../canvas_page.c). The linked-list
+document model is in [`canvas.h`](../../canvas.h) and
+[`canvas.c`](../../canvas.c); reusable stroke maintenance, projection and
+rendering are in [`canvas_state.h`](../../canvas_state.h) and
+[`canvas_state.c`](../../canvas_state.c). Their complete ownership, lifecycle
+and reuse contract is documented in
+[Reusable canvas state](../canvas-state.md).
 
 The original layout sketch is available as
 [`note_canvas_design.png`](../../design_drafts/canvas/note_canvas_design.png).
@@ -33,14 +38,15 @@ flowchart TD
     Kind -- "mouse" --> Hit{"Hit test"}
     Hit -- "palette" --> Select
     Hit -- "toolbar" --> Command
-    Hit -- "canvas press or drag" --> Stroke["Build pending stroke in world coordinates"]
-    Hit -- "release" --> Commit["Commit one DRAW_CELLS operation"]
+    Hit -- "canvas press or drag" --> Stroke["CanvasState builds a pending world-coordinate stroke"]
+    Hit -- "release" --> Commit["CanvasState commits one DRAW_CELLS operation"]
     Command --> Dirty["Mark frame dirty"]
     Select --> Dirty
     Stroke --> Dirty
     Commit --> Dirty
     Dirty --> Render["Rebuild page frame when render runs"]
-    Render --> Base["Paint draft and final-output backgrounds"]
+    Render --> StateRender["canvas_state_render"]
+    StateRender --> Base["Paint draft and final-output backgrounds"]
     Base --> Replay["Replay history through cursor"]
     Replay --> Pending["Overlay pending stroke"]
     Pending --> Chrome["Draw toolbox, palette and toolbar"]
@@ -80,8 +86,9 @@ Y increases downwards to match terminal coordinates. Because history stores
 world coordinates, changing the draft viewport or surrounding panel widths
 only changes projection; it does not move existing content.
 
-`canvas_screen_to_world()` is used for mouse input.
-`canvas_world_to_screen()` clips replayed samples to the current viewport.
+`canvas_viewport_screen_to_world()` is used for mouse input.
+`canvas_viewport_world_to_screen()` clips replayed samples to the current
+viewport.
 `canvas_document_contains_output()` decides which background hint applies and
 which cells will belong to the future final output.
 
@@ -144,6 +151,43 @@ Owns the configured `output_size`, its `CanvasHistory`, and a monotonically
 increasing `revision`. Draft samples outside `output_size` remain in the same
 history and are not discarded.
 
+## Reusable canvas state
+
+`CanvasState` is independent of `Page`, `CanvasPage`, terminal input and the F2
+layout. Another page can own one, feed it world-coordinate samples, and render
+it into any `TuiCell` buffer by supplying a viewport and colors. This section
+describes how F2 integrates it; see
+[Reusable canvas state](../canvas-state.md) for the complete module API,
+ownership rules, lifecycle and reuse example.
+
+### `CanvasStroke`
+
+Owns the dynamically growing pending `CanvasSample` array, the complete
+`TuiCell` copied into each sample, and active/count/capacity metadata. Appending
+a point fills the cells between the previous point and the new point with
+Bresenham interpolation and suppresses adjacent duplicates.
+
+### `CanvasState`
+
+| Field | Meaning |
+| --- | --- |
+| `document` | Linked-list history and configured final-output size |
+| `pending_stroke` | Uncommitted stroke rendered above applied history |
+
+### Rendering and projection values
+
+| Structure | Role |
+| --- | --- |
+| `CanvasViewport` | Drawable screen rectangle plus the screen cell representing world `(0, 0)` |
+| `CanvasRenderStyle` | Default foreground and draft/output hint backgrounds |
+| `CanvasRenderTarget` | Destination size, `TuiCell` buffer, viewport and render style |
+
+`canvas_state_render()` first clears only the viewport to the appropriate
+draft/output backgrounds, then replays applied history, then overlays the
+pending stroke. A sample that keeps `TUI_COLOR_DEFAULT` inherits the render
+target's foreground and region background; explicit sample colors are
+preserved.
+
 ### Page-private structures
 
 These structures are private to `canvas_page.c`:
@@ -152,9 +196,7 @@ These structures are private to `canvas_page.c`:
 | --- | --- |
 | `CanvasPalette` | Fixed ASCII entries, selected index and scroll row |
 | `CanvasLayout` | Panel/view rectangles, world origin, palette grid and button hit boxes |
-| `CanvasStroke` | Current character and dynamically growing sample batch |
-| `CanvasPage` | Document, palette, layout, pending stroke, status and dirty flags |
-| `CanvasReplayContext` | Connects replay callbacks to the current page frame |
+| `CanvasPage` | Reusable `CanvasState`, palette, layout, status and dirty flags |
 
 ## Principal document functions
 
@@ -171,6 +213,22 @@ These structures are private to `canvas_page.c`:
 
 These functions do not depend on TTY state and are covered by
 [`canvas_test.c`](../../canvas_test.c).
+
+## Principal state functions
+
+| Function | Role |
+| --- | --- |
+| `canvas_state_init/destroy/reset` | Own and release a complete reusable state |
+| `canvas_state_begin_stroke` | Finalize any previous stroke, copy a `TuiCell`, and add the first sample |
+| `canvas_state_append_stroke` | Append interpolated world-coordinate samples |
+| `canvas_state_finalize_stroke` | Commit the pending samples as one history node |
+| `canvas_state_cancel_stroke` | Discard the pending samples without changing history |
+| `canvas_state_stroke_active` | Query whether an uncommitted stroke exists |
+| `canvas_state_can_undo/redo` | Query history movement availability |
+| `canvas_state_undo/redo` | Finalize a pending stroke, then move the history cursor |
+| `canvas_viewport_screen_to_world` | Convert a clipped screen coordinate to centered world space |
+| `canvas_viewport_world_to_screen` | Project and clip a world coordinate into a viewport |
+| `canvas_state_render` | Render backgrounds, applied history and the pending stroke to a cell buffer |
 
 ## Principal page functions
 
@@ -193,33 +251,32 @@ palette but retains ASCII value 32.
 | `canvas_page_handle_event` | Route Ctrl commands, plain text and mouse events |
 | `canvas_page_update` | Recompute layout when the page frame size changes |
 | `canvas_page_render` | Rebuild the page frame only when dirty |
-| `canvas_page_destroy` | Free pending stroke storage, document history and page state |
+| `canvas_page_destroy` | Destroy its `CanvasState` and free page state |
 
-### Input and stroke helpers
+### Input and command helpers
 
 | Function group | Role |
 | --- | --- |
 | `canvas_palette_select`, `canvas_palette_hit` | Keyboard/mouse character selection |
-| `canvas_stroke_begin` | Capture the selected character and first world coordinate |
-| `canvas_stroke_append` | Add Bresenham-interpolated samples without adjacent duplicates |
-| `canvas_stroke_finalize` | Commit the pending sample batch as one undoable operation |
-| `canvas_stroke_cancel` | Drop an uncommitted stroke |
+| `canvas_page_viewport` | Adapt current page layout to a reusable `CanvasViewport` |
+| `canvas_page_finalize_stroke` | Finalize through `CanvasState` and invalidate the page frame |
 | `canvas_page_handle_mouse` | Palette, toolbar and Canvas hit testing |
 | `canvas_page_new_document/undo/redo` | Implement document commands and status updates |
 
 Changing the selected character finalizes an active stroke first, ensuring one
-operation never mixes palette characters.
+operation never mixes palette characters. All stroke allocation, interpolation
+and history mutation occur through `canvas_state_*`; the page controller does
+not maintain its own sample array.
 
 ### Rendering helpers
 
 | Function group | Role |
 | --- | --- |
 | `canvas_frame_put/fill/text/box` | Bounds-checked page-frame primitives |
-| `canvas_page_draw_canvas` | Paint backgrounds, replay history and overlay pending samples |
+| `canvas_page_draw_canvas` | Box the panel and invoke `canvas_state_render` |
 | `canvas_page_draw_palette` | Render the ASCII grid and selection highlight |
 | `canvas_page_draw_toolbox` | Render the current Draw tool and future-tools placeholder |
 | `canvas_page_draw_toolbar` | Render actions, availability and status |
-| `canvas_page_draw_sample` | Project one world-space `CanvasSample` into the viewport |
 
 The final-output hint background is a presentation concern and is not written
 into document history when a sample uses the default background color.
