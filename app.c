@@ -77,6 +77,64 @@ static void app_update_active_flags(App *app)
     }
 }
 
+static TgResult app_set_active_page(
+    App *app,
+    size_t page_index,
+    PageLeaveReason leave_reason)
+{
+    if (app == NULL || page_index >= app->page_count) {
+        return TG_ERR_INVALID;
+    }
+    if (page_index == app->active_page &&
+        app->pages[page_index].entered) {
+        return TG_OK;
+    }
+
+    if (app->active_page < app->page_count) {
+        Page *old_page = &app->pages[app->active_page];
+        if (old_page->entered && old_page->ops.on_leave != NULL) {
+            TgResult result = old_page->ops.on_leave(old_page, leave_reason);
+            if (tg_result_err(result)) {
+                return result;
+            }
+        }
+        old_page->entered = false;
+    }
+
+    app->active_page = page_index;
+    app_update_active_flags(app);
+
+    Page *new_page = &app->pages[page_index];
+    if (new_page->ops.on_enter != NULL) {
+        TgResult result = new_page->ops.on_enter(new_page);
+        if (tg_result_err(result)) {
+            return result;
+        }
+    }
+    new_page->entered = true;
+    return TG_OK;
+}
+
+static bool app_event_is_control_char(
+    const TuiInputEvent *event,
+    unsigned char ch)
+{
+    return event != NULL &&
+           event->type == TUI_INPUT_KEY &&
+           (event->modifiers & TUI_MOD_CONTROL) != 0 &&
+           event->ch == ch;
+}
+
+static bool app_event_is_plain_key(
+    const TuiInputEvent *event,
+    TuiKey key)
+{
+    return event != NULL &&
+           event->type == TUI_INPUT_KEY &&
+           event->modifiers == TUI_MOD_NONE &&
+           event->key == key;
+}
+
 static void app_draw_footer(App *app)
 {
     TuiCell *screen = tui_get_buffer();
@@ -142,6 +200,10 @@ void app_config_defaults(AppConfig *config)
     }
 
     config->screen_size = (TgSizei){APP_DEFAULT_WIDTH, APP_DEFAULT_HEIGHT};
+    config->canvas_output_size = (TgSizei){
+        APP_DEFAULT_CANVAS_WIDTH,
+        APP_DEFAULT_CANVAS_HEIGHT,
+    };
     config->target_fps = APP_DEFAULT_FPS;
     config->footer_height = APP_FOOTER_HEIGHT;
 }
@@ -161,6 +223,8 @@ TgResult app_config_load(AppConfig *config, const char *path)
 
     long width = config->screen_size.w;
     long height = config->screen_size.h;
+    long canvas_width = config->canvas_output_size.w;
+    long canvas_height = config->canvas_output_size.h;
     long fps = (long)config->target_fps;
 
     TgResult result = app_config_read_positive_long(
@@ -168,6 +232,14 @@ TgResult app_config_load(AppConfig *config, const char *path)
     if (tg_result_ok(result)) {
         result = app_config_read_positive_long(
             &source, "tui_height", INT32_MAX, &height);
+    }
+    if (tg_result_ok(result)) {
+        result = app_config_read_positive_long(
+            &source, "canvas_width", INT32_MAX, &canvas_width);
+    }
+    if (tg_result_ok(result)) {
+        result = app_config_read_positive_long(
+            &source, "canvas_height", INT32_MAX, &canvas_height);
     }
     if (tg_result_ok(result)) {
         result = app_config_read_positive_long(
@@ -181,6 +253,10 @@ TgResult app_config_load(AppConfig *config, const char *path)
 
     if (tg_result_ok(result)) {
         config->screen_size = (TgSizei){(int32_t)width, (int32_t)height};
+        config->canvas_output_size = (TgSizei){
+            (int32_t)canvas_width,
+            (int32_t)canvas_height,
+        };
         config->target_fps = (unsigned)fps;
     }
 
@@ -192,12 +268,12 @@ TgResult app_add_page(
     App *app,
     const char *title,
     TuiKey shortcut,
-    PageUpdateFn update,
+    const PageOps *ops,
     void *userdata)
 {
     if (app == NULL ||
         title == NULL ||
-        update == NULL ||
+        ops == NULL ||
         app->page_count >= APP_MAX_PAGES) {
         return TG_ERR_INVALID;
     }
@@ -217,11 +293,12 @@ TgResult app_add_page(
         .title = title,
         .shortcut = shortcut,
         .active = app->page_count == app->active_page,
+        .entered = false,
         .frame = {
             .size = app->content_size,
             .cells = cells,
         },
-        .update = update,
+        .ops = *ops,
         .userdata = userdata,
     };
     app_frame_clear(&page->frame);
@@ -235,6 +312,8 @@ TgResult app_init(App *app, const AppConfig *config)
         config == NULL ||
         config->screen_size.w <= 0 ||
         config->screen_size.h <= config->footer_height ||
+        config->canvas_output_size.w <= 0 ||
+        config->canvas_output_size.h <= 0 ||
         config->footer_height != APP_FOOTER_HEIGHT ||
         config->target_fps == 0) {
         return TG_ERR_INVALID;
@@ -261,6 +340,11 @@ TgResult app_init(App *app, const AppConfig *config)
     }
 
     app_update_active_flags(app);
+    result = app_set_active_page(app, app->active_page, PAGE_LEAVE_SWITCH);
+    if (tg_result_err(result)) {
+        app_shutdown(app);
+        return result;
+    }
     app->last_frame_ns = app_now_ns();
     return TG_OK;
 }
@@ -271,9 +355,21 @@ void app_shutdown(App *app)
         return;
     }
 
-    for (size_t i = 0; i < app->page_count; ++i) {
-        free(app->pages[i].frame.cells);
-        app->pages[i].frame.cells = NULL;
+    if (app->active_page < app->page_count) {
+        Page *active = &app->pages[app->active_page];
+        if (active->entered && active->ops.on_leave != NULL) {
+            (void)active->ops.on_leave(active, PAGE_LEAVE_SHUTDOWN);
+        }
+        active->entered = false;
+    }
+
+    for (size_t i = app->page_count; i > 0; --i) {
+        Page *page = &app->pages[i - 1u];
+        if (page->ops.destroy != NULL) {
+            page->ops.destroy(page);
+        }
+        free(page->frame.cells);
+        page->frame.cells = NULL;
     }
     app->page_count = 0;
 
@@ -289,10 +385,10 @@ bool app_should_close(const App *app)
     return app == NULL || !app->running;
 }
 
-void app_begin_frame(App *app)
+TgResult app_begin_frame(App *app)
 {
     if (app == NULL) {
-        return;
+        return TG_ERR_INVALID;
     }
 
     app->frame_start_ns = app_now_ns();
@@ -304,33 +400,89 @@ void app_begin_frame(App *app)
     }
     app->last_frame_ns = app->frame_start_ns;
 
-    if (tui_key_clicked(TUI_KEY_ESCAPE) || tui_char_clicked('q')) {
-        app->running = false;
-        return;
-    }
-
-    for (size_t i = 0; i < app->page_count; ++i) {
-        if (tui_key_clicked(app->pages[i].shortcut)) {
-            app->active_page = i;
-            break;
-        }
-    }
-    app_update_active_flags(app);
+    return tui_poll_events();
 }
 
-void app_update_pages(App *app)
+TgResult app_dispatch_events(App *app)
 {
-    if (app == NULL) {
-        return;
+    if (app == NULL || app->page_count == 0) {
+        return TG_ERR_INVALID;
+    }
+
+    const TuiInputEvent *events = tui_input_events();
+    size_t event_count = tui_input_event_count();
+    for (size_t event_index = 0;
+         event_index < event_count;
+         ++event_index) {
+        const TuiInputEvent *event = &events[event_index];
+
+        if (app_event_is_control_char(event, 'q')) {
+            app->running = false;
+            return TG_OK;
+        }
+
+        bool switched = false;
+        for (size_t page_index = 0;
+             page_index < app->page_count;
+             ++page_index) {
+            if (app_event_is_plain_key(
+                    event,
+                    app->pages[page_index].shortcut)) {
+                TgResult result = app_set_active_page(
+                    app,
+                    page_index,
+                    PAGE_LEAVE_SWITCH);
+                if (tg_result_err(result)) {
+                    return result;
+                }
+                switched = true;
+                break;
+            }
+        }
+        if (switched) {
+            continue;
+        }
+
+        Page *active = &app->pages[app->active_page];
+        if (active->ops.handle_event != NULL) {
+            TgResult result = active->ops.handle_event(active, event);
+            if (tg_result_err(result)) {
+                return result;
+            }
+        }
+    }
+    return TG_OK;
+}
+
+TgResult app_update_active_page(App *app)
+{
+    if (app == NULL || app->active_page >= app->page_count) {
+        return TG_ERR_INVALID;
     }
 
     AppFrameContext context = {
         .frame_index = app->frame_index,
         .delta_time = app->delta_time,
     };
-    for (size_t i = 0; i < app->page_count; ++i) {
-        app->pages[i].update(&app->pages[i], &context);
+
+    Page *active = &app->pages[app->active_page];
+    if (active->ops.update == NULL) {
+        return TG_OK;
     }
+    return active->ops.update(active, &context);
+}
+
+TgResult app_render_active_page(App *app)
+{
+    if (app == NULL || app->active_page >= app->page_count) {
+        return TG_ERR_INVALID;
+    }
+
+    Page *active = &app->pages[app->active_page];
+    if (active->ops.render == NULL) {
+        return TG_OK;
+    }
+    return active->ops.render(active);
 }
 
 void app_compose(App *app)

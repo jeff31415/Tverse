@@ -1,112 +1,109 @@
 #include "pages.h"
 
-static void page_f1_update(Page *page, const AppFrameContext *context)
+#include "canvas_page.h"
+
+static TgResult simple_page_on_enter(Page *page)
 {
-    (void)context;
-    if (!page->active) {
-        return;
+    if (page == NULL) {
+        return TG_ERR_INVALID;
     }
-    /* F1 page implementation goes here. */
+    app_frame_clear(&page->frame);
+    return TG_OK;
 }
 
-static void page_f2_update(Page *page, const AppFrameContext *context)
+static TgResult simple_page_on_leave(
+    Page *page,
+    PageLeaveReason reason)
 {
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F2 page implementation goes here. */
+    (void)reason;
+    return page == NULL ? TG_ERR_INVALID : TG_OK;
 }
 
-static void page_f3_update(Page *page, const AppFrameContext *context)
+static TgResult simple_page_handle_event(
+    Page *page,
+    const TuiInputEvent *event)
 {
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F3 page implementation goes here. */
+    return page == NULL || event == NULL ? TG_ERR_INVALID : TG_OK;
 }
 
-static void page_f4_update(Page *page, const AppFrameContext *context)
+static TgResult simple_page_update(
+    Page *page,
+    const AppFrameContext *context)
 {
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F4 page implementation goes here. */
+    return page == NULL || context == NULL ? TG_ERR_INVALID : TG_OK;
 }
 
-static void page_f5_update(Page *page, const AppFrameContext *context)
+static TgResult simple_page_render(Page *page)
 {
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F5 page implementation goes here. */
+    return page == NULL ? TG_ERR_INVALID : TG_OK;
 }
 
-static void page_f6_update(Page *page, const AppFrameContext *context)
+static PageOps simple_page_ops(void)
 {
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F6 page implementation goes here. */
-}
-
-static void page_f7_update(Page *page, const AppFrameContext *context)
-{
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F7 page implementation goes here. */
-}
-
-static void page_f8_update(Page *page, const AppFrameContext *context)
-{
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F8 page implementation goes here. */
-}
-
-static void page_f9_update(Page *page, const AppFrameContext *context)
-{
-    (void)context;
-    if (!page->active) {
-        return;
-    }
-    /* F9 page implementation goes here. */
+    return (PageOps){
+        .on_enter = simple_page_on_enter,
+        .on_leave = simple_page_on_leave,
+        .handle_event = simple_page_handle_event,
+        .update = simple_page_update,
+        .render = simple_page_render,
+        .destroy = NULL,
+    };
 }
 
 TgResult app_register_default_pages(App *app)
 {
+    if (app == NULL) {
+        return TG_ERR_INVALID;
+    }
+
     static const struct {
         const char *title;
         TuiKey shortcut;
-        PageUpdateFn update;
+        bool canvas;
     } definitions[] = {
-        {"Page 1", TUI_KEY_F1, page_f1_update},
-        {"Page 2", TUI_KEY_F2, page_f2_update},
-        {"Page 3", TUI_KEY_F3, page_f3_update},
-        {"Page 4", TUI_KEY_F4, page_f4_update},
-        {"Page 5", TUI_KEY_F5, page_f5_update},
-        {"Page 6", TUI_KEY_F6, page_f6_update},
-        {"Page 7", TUI_KEY_F7, page_f7_update},
-        {"Page 8", TUI_KEY_F8, page_f8_update},
-        {"Page 9", TUI_KEY_F9, page_f9_update},
+        {"Page 1", TUI_KEY_F1, false},
+        {"Canvas", TUI_KEY_F2, true},
+        {"Page 3", TUI_KEY_F3, false},
+        {"Page 4", TUI_KEY_F4, false},
+        {"Page 5", TUI_KEY_F5, false},
+        {"Page 6", TUI_KEY_F6, false},
+        {"Page 7", TUI_KEY_F7, false},
+        {"Page 8", TUI_KEY_F8, false},
+        {"Page 9", TUI_KEY_F9, false},
     };
 
-    for (size_t i = 0; i < sizeof(definitions) / sizeof(definitions[0]); ++i) {
+    for (size_t i = 0;
+         i < sizeof(definitions) / sizeof(definitions[0]);
+         ++i) {
+        PageOps ops = simple_page_ops();
+        void *userdata = NULL;
+
+        if (definitions[i].canvas) {
+            CanvasPage *canvas = NULL;
+            TgResult result = canvas_page_create(
+                app->config.canvas_output_size,
+                &canvas);
+            if (tg_result_err(result)) {
+                return result;
+            }
+            userdata = canvas;
+            ops = canvas_page_ops();
+        }
+
         TgResult result = app_add_page(
             app,
             definitions[i].title,
             definitions[i].shortcut,
-            definitions[i].update,
-            NULL);
+            &ops,
+            userdata);
         if (tg_result_err(result)) {
+            if (definitions[i].canvas) {
+                Page temporary = {
+                    .ops = ops,
+                    .userdata = userdata,
+                };
+                ops.destroy(&temporary);
+            }
             return result;
         }
     }

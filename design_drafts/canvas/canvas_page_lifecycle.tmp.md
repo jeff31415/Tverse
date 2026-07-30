@@ -37,7 +37,7 @@ sequenceDiagram
 
         Main->>App: app_dispatch_events()
         loop 每个事件
-            App->>App: 处理 Ctrl+Q / Ctrl+F1-F9
+            App->>App: 处理 Ctrl+Q / F1-F9
             App->>Page: handle_event(event)
             Page->>Canvas: 选择字符或修改历史
         end
@@ -54,4 +54,3 @@ sequenceDiagram
         App->>TUI: tui_present()
     end
 ```
-

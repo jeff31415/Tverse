@@ -26,11 +26,26 @@ int main(int argc, char *argv[])
     }
 
     while (!app_should_close(&app)) {
-        app_begin_frame(&app);
-        if (app_should_close(&app)) {
+        result = app_begin_frame(&app);
+        if (tg_result_err(result)) {
             break;
         }
-        app_update_pages(&app);
+
+        result = app_dispatch_events(&app);
+        if (tg_result_err(result) || app_should_close(&app)) {
+            break;
+        }
+
+        result = app_update_active_page(&app);
+        if (tg_result_err(result)) {
+            break;
+        }
+
+        result = app_render_active_page(&app);
+        if (tg_result_err(result)) {
+            break;
+        }
+
         app_compose(&app);
         result = app_end_frame(&app);
         if (tg_result_err(result)) {
