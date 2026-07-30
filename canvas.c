@@ -3,6 +3,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef CANVAS_TESTING
+#include "tests/canvas_test_allocator.h"
+#include "tests/canvas_test_hooks.h"
+
+#define calloc canvas_test_calloc
+#define free canvas_test_free
+#define malloc canvas_test_malloc
+#endif
+
 struct CanvasOperation {
     CanvasOperationType type;
     CanvasOperation *prev;
@@ -10,6 +19,58 @@ struct CanvasOperation {
     CanvasSample *samples;
     size_t sample_count;
 };
+
+static CanvasOperation *canvas_operation_find_cycle(
+    CanvasOperation *operation)
+{
+    CanvasOperation *slow = operation;
+    CanvasOperation *fast = operation;
+
+    while (fast != NULL && fast->next != NULL) {
+        slow = slow->next;
+        fast = fast->next->next;
+        if (slow == fast) {
+            return slow;
+        }
+    }
+    return NULL;
+}
+
+static bool canvas_operation_chain_has_cycle(
+    const CanvasOperation *operation)
+{
+    const CanvasOperation *slow = operation;
+    const CanvasOperation *fast = operation;
+
+    while (fast != NULL && fast->next != NULL) {
+        slow = slow->next;
+        fast = fast->next->next;
+        if (slow == fast) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void canvas_operation_break_cycle(CanvasOperation *operation)
+{
+    CanvasOperation *meeting = canvas_operation_find_cycle(operation);
+    if (meeting == NULL) {
+        return;
+    }
+
+    CanvasOperation *cycle_start = operation;
+    while (cycle_start != meeting) {
+        cycle_start = cycle_start->next;
+        meeting = meeting->next;
+    }
+
+    CanvasOperation *cycle_tail = cycle_start;
+    while (cycle_tail->next != cycle_start) {
+        cycle_tail = cycle_tail->next;
+    }
+    cycle_tail->next = NULL;
+}
 
 static void canvas_document_touch(CanvasDocument *document)
 {
@@ -21,6 +82,7 @@ static void canvas_document_touch(CanvasDocument *document)
 static size_t canvas_operation_free_chain(CanvasOperation *operation)
 {
     size_t count = 0;
+    canvas_operation_break_cycle(operation);
     while (operation != NULL) {
         CanvasOperation *next = operation->next;
         free(operation->samples);
@@ -71,6 +133,9 @@ TgResult canvas_document_commit_draw(
     size_t sample_count)
 {
     if (document == NULL || (sample_count > 0 && samples == NULL)) {
+        return TG_ERR_INVALID;
+    }
+    if (canvas_operation_chain_has_cycle(document->history.head)) {
         return TG_ERR_INVALID;
     }
     if (sample_count == 0) {
@@ -134,12 +199,15 @@ TgResult canvas_document_commit_draw(
 
 bool canvas_document_can_undo(const CanvasDocument *document)
 {
-    return document != NULL && document->history.cursor != NULL;
+    return document != NULL &&
+           document->history.cursor != NULL &&
+           !canvas_operation_chain_has_cycle(document->history.head);
 }
 
 bool canvas_document_can_redo(const CanvasDocument *document)
 {
-    if (document == NULL) {
+    if (document == NULL ||
+        canvas_operation_chain_has_cycle(document->history.head)) {
         return false;
     }
     if (document->history.cursor == NULL) {
@@ -177,7 +245,10 @@ void canvas_document_replay(
     CanvasReplayFn replay,
     void *userdata)
 {
-    if (document == NULL || replay == NULL || document->history.cursor == NULL) {
+    if (document == NULL ||
+        replay == NULL ||
+        document->history.cursor == NULL ||
+        canvas_operation_chain_has_cycle(document->history.head)) {
         return;
     }
 
@@ -215,3 +286,32 @@ bool canvas_document_contains_output(
            (int64_t)position.x < max_x &&
            (int64_t)position.y < max_y;
 }
+
+#ifdef CANVAS_TESTING
+bool canvas_test_history_make_cycle(CanvasDocument *document)
+{
+    if (document == NULL ||
+        document->history.head == NULL ||
+        document->history.tail == NULL) {
+        return false;
+    }
+
+    document->history.tail->next = document->history.head;
+    document->history.head->prev = document->history.tail;
+    return true;
+}
+
+bool canvas_test_history_break_cycle(CanvasDocument *document)
+{
+    if (document == NULL ||
+        !canvas_operation_chain_has_cycle(document->history.head)) {
+        return false;
+    }
+
+    canvas_operation_break_cycle(document->history.head);
+    if (document->history.head != NULL) {
+        document->history.head->prev = NULL;
+    }
+    return true;
+}
+#endif

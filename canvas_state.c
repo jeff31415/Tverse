@@ -3,6 +3,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef CANVAS_TESTING
+#include "tests/canvas_test_allocator.h"
+
+#define free canvas_test_free
+#define realloc canvas_test_realloc
+#endif
+
 typedef struct CanvasStateReplayContext {
     const CanvasState *state;
     const CanvasRenderTarget *target;
