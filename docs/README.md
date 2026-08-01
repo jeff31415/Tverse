@@ -1,7 +1,7 @@
 # draw_app documentation
 
 `draw_app` is a page-oriented terminal application built on the low-level
-[`tui`](../../tui/README.md) backend. It currently provides nine F-key pages,
+[`tui`](../deps/corestack/src/tui/README.md) backend. It currently provides nine F-key pages,
 an application-level page lifecycle, and an implemented Canvas page on F2.
 
 ## Documents
@@ -26,7 +26,7 @@ Run with built-in defaults:
 Or pass a configuration file:
 
 ```sh
-./build/draw_app src/draw_app/draw_app.conf.example
+./build/draw_app draw_app.conf.example
 ```
 
 Defaults are assigned explicitly before an optional file is loaded:
@@ -40,7 +40,7 @@ Defaults are assigned explicitly before an optional file is loaded:
 | `target_fps` | 30 | Main-loop frame limit |
 
 The configuration file uses the `name=value` syntax documented by
-[`config`](../../config/README.md). Width, height, and FPS must be positive.
+[`config`](../deps/corestack/src/config/README.md). Width, height, and FPS must be positive.
 Height must leave at least one row above the fixed one-row footer.
 
 ## Shortcuts
@@ -71,8 +71,7 @@ shortcuts:
 - [`canvas_page.h`](../canvas_page.h) and
   [`canvas_page.c`](../canvas_page.c): F2 input, layout, palette and page chrome.
 - [`pages.c`](../pages.c): page registration and placeholder pages.
-- [`canvas_test.c`](../canvas_test.c): document history, state, projection and
-  rendering tests.
+- [`tests`](../tests/): document history, state, projection and rendering tests.
 - [`draw_app.conf.example`](../draw_app.conf.example): complete optional
   configuration example.
 

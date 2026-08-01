@@ -45,8 +45,8 @@ add_library(draw_canvas_test_subject OBJECT
     "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_state.c")
 target_compile_definitions(draw_canvas_test_subject PRIVATE CANVAS_TESTING=1)
 target_include_directories(draw_canvas_test_subject PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/.."
-    "${PROJECT_SOURCE_DIR}/include")
+    "${CMAKE_CURRENT_SOURCE_DIR}/..")
+target_link_libraries(draw_canvas_test_subject PRIVATE corestack::tui)
 enable_draw_canvas_test_sanitizers(draw_canvas_test_subject)
 
 function(add_draw_canvas_test target source)
@@ -54,11 +54,11 @@ function(add_draw_canvas_test target source)
         "${source}"
         $<TARGET_OBJECTS:draw_canvas_test_subject>)
     target_include_directories("${target}" PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/.."
-        "${PROJECT_SOURCE_DIR}/include")
+        "${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_link_libraries("${target}" PRIVATE
         draw_canvas_test_support
-        draw_canvas_unity)
+        draw_canvas_unity
+        corestack::tui)
     enable_draw_canvas_test_sanitizers("${target}")
     set_target_properties("${target}" PROPERTIES
         RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")

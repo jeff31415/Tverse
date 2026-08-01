@@ -207,4 +207,4 @@ color, and style into a `TuiCell`, translating pointer input through its
   remain future consumers of the document history.
 
 The state, projection and rendering behavior is covered by
-[`canvas_test.c`](../canvas_test.c).
+the [`tests`](../tests/) directory.

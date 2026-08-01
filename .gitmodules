@@ -1,0 +1,3 @@
+[submodule "corestack"]
+	path = deps/corestack
+	url = https://github.com/minh-cv/corestack.git

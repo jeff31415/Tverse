@@ -1,0 +1,7 @@
+build/
+build_tests/
+.cache/
+.vscode/
+compile_commands.json
+draw_app.conf
+*autosave.xopp

@@ -13,7 +13,7 @@ import sys
 from typing import Mapping, Sequence, TextIO
 
 
-PROJECT_ROOT = Path(__file__).resolve().parents[3]
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_BUILD_DIR = PROJECT_ROOT / "build_tests"
 DEFAULT_REPORT_NAME = "test_report.txt"
 

@@ -212,7 +212,7 @@ These structures are private to `canvas_page.c`:
 | `canvas_document_contains_output` | Test a world coordinate against the final-output bounds |
 
 These functions do not depend on TTY state and are covered by
-[`canvas_test.c`](../../canvas_test.c).
+the [`tests`](../../tests/) directory.
 
 ## Principal state functions
 
