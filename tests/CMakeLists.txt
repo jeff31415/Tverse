@@ -33,20 +33,29 @@ endfunction()
 
 add_library(draw_canvas_unity STATIC unity.c)
 target_include_directories(draw_canvas_unity PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(draw_canvas_unity PRIVATE draw_app_warnings)
 enable_draw_canvas_test_sanitizers(draw_canvas_unity)
 
 add_library(draw_canvas_test_support STATIC canvas_test_allocator.c)
 target_include_directories(draw_canvas_test_support
     PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+target_link_libraries(draw_canvas_test_support PRIVATE draw_app_warnings)
 enable_draw_canvas_test_sanitizers(draw_canvas_test_support)
 
 add_library(draw_canvas_test_subject OBJECT
     "${CMAKE_CURRENT_SOURCE_DIR}/../canvas.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_json.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_json_cjson.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_json_jansson.c"
     "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_state.c")
 target_compile_definitions(draw_canvas_test_subject PRIVATE CANVAS_TESTING=1)
 target_include_directories(draw_canvas_test_subject PRIVATE
-    "${CMAKE_CURRENT_SOURCE_DIR}/..")
-target_link_libraries(draw_canvas_test_subject PRIVATE corestack::tui)
+    "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../deps/cjson")
+target_link_libraries(draw_canvas_test_subject PRIVATE
+    draw_app_warnings
+    corestack::tui
+    ${DRAW_JANSSON_TARGET})
 enable_draw_canvas_test_sanitizers(draw_canvas_test_subject)
 
 function(add_draw_canvas_test target source)
@@ -56,8 +65,11 @@ function(add_draw_canvas_test target source)
     target_include_directories("${target}" PRIVATE
         "${CMAKE_CURRENT_SOURCE_DIR}/..")
     target_link_libraries("${target}" PRIVATE
+        draw_app_warnings
         draw_canvas_test_support
         draw_canvas_unity
+        cjson
+        ${DRAW_JANSSON_TARGET}
         corestack::tui)
     enable_draw_canvas_test_sanitizers("${target}")
     set_target_properties("${target}" PROPERTIES
@@ -74,6 +86,9 @@ endfunction()
 # The regular bundle contains tests that can safely share one process.
 add_draw_canvas_test(draw_canvas_test_bundle test_canvas_bundle.c)
 set_tests_properties(draw_canvas_test_bundle PROPERTIES LABELS "unit")
+
+add_draw_canvas_test(draw_canvas_test_json test_canvas_json.c)
+set_tests_properties(draw_canvas_test_json PROPERTIES LABELS "unit")
 
 # These cases get their own process so a timeout, signal, or memory corruption
 # cannot prevent the regular bundle or another hazardous case from running.

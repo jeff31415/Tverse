@@ -1,5 +1,7 @@
 #include "canvas_page.h"
 
+#include "canvas_frame.h"
+#include "canvas_json.h"
 #include "canvas_state.h"
 
 #include <stdio.h>
@@ -20,6 +22,7 @@
 #define CANVAS_COLOR_MUTED 0x82909cu
 #define CANVAS_COLOR_ACCENT 0x4f8fcdu
 #define CANVAS_COLOR_DISABLED 0x3d4852u
+#define CANVAS_SAVE_PATH "canvas.json"
 
 typedef enum CanvasButton {
     CANVAS_BUTTON_NEW = 0,
@@ -84,180 +87,6 @@ static TuiCell canvas_cell(
     cell.bg = bg;
     cell.style = style;
     return cell;
-}
-
-static void canvas_frame_put(
-    AppFrame *frame,
-    int x,
-    int y,
-    unsigned char ch,
-    uint32_t fg,
-    uint32_t bg,
-    uint16_t style)
-{
-    if (frame == NULL ||
-        frame->cells == NULL ||
-        x < 0 ||
-        y < 0 ||
-        x >= frame->size.w ||
-        y >= frame->size.h) {
-        return;
-    }
-
-    size_t index = (size_t)y * (size_t)frame->size.w + (size_t)x;
-    frame->cells[index] = canvas_cell(ch, fg, bg, style);
-}
-
-static void canvas_frame_fill(
-    AppFrame *frame,
-    TgRecti rect,
-    uint32_t fg,
-    uint32_t bg,
-    uint16_t style)
-{
-    if (frame == NULL || frame->cells == NULL) {
-        return;
-    }
-
-    int x_start = rect.x < 0 ? 0 : rect.x;
-    int y_start = rect.y < 0 ? 0 : rect.y;
-    int64_t raw_x_end = (int64_t)rect.x + rect.w;
-    int64_t raw_y_end = (int64_t)rect.y + rect.h;
-    int x_end = raw_x_end > frame->size.w
-        ? frame->size.w
-        : (int)raw_x_end;
-    int y_end = raw_y_end > frame->size.h
-        ? frame->size.h
-        : (int)raw_y_end;
-
-    for (int y = y_start; y < y_end; ++y) {
-        for (int x = x_start; x < x_end; ++x) {
-            canvas_frame_put(frame, x, y, ' ', fg, bg, style);
-        }
-    }
-}
-
-static void canvas_frame_text(
-    AppFrame *frame,
-    int x,
-    int y,
-    const char *text,
-    uint32_t fg,
-    uint32_t bg,
-    uint16_t style)
-{
-    if (text == NULL) {
-        return;
-    }
-
-    for (size_t i = 0; text[i] != '\0'; ++i) {
-        canvas_frame_put(
-            frame,
-            x + (int)i,
-            y,
-            (unsigned char)text[i],
-            fg,
-            bg,
-            style);
-    }
-}
-
-static void canvas_frame_box(
-    AppFrame *frame,
-    TgRecti rect,
-    const char *title)
-{
-    if (rect.w <= 0 || rect.h <= 0) {
-        return;
-    }
-
-    canvas_frame_fill(
-        frame,
-        rect,
-        CANVAS_COLOR_TEXT,
-        CANVAS_COLOR_PANEL_BG,
-        TUI_STYLE_NONE);
-
-    for (int x = rect.x; x < rect.x + rect.w; ++x) {
-        canvas_frame_put(
-            frame,
-            x,
-            rect.y,
-            '-',
-            CANVAS_COLOR_BORDER,
-            CANVAS_COLOR_PANEL_BG,
-            TUI_STYLE_NONE);
-        canvas_frame_put(
-            frame,
-            x,
-            rect.y + rect.h - 1,
-            '-',
-            CANVAS_COLOR_BORDER,
-            CANVAS_COLOR_PANEL_BG,
-            TUI_STYLE_NONE);
-    }
-    for (int y = rect.y; y < rect.y + rect.h; ++y) {
-        canvas_frame_put(
-            frame,
-            rect.x,
-            y,
-            '|',
-            CANVAS_COLOR_BORDER,
-            CANVAS_COLOR_PANEL_BG,
-            TUI_STYLE_NONE);
-        canvas_frame_put(
-            frame,
-            rect.x + rect.w - 1,
-            y,
-            '|',
-            CANVAS_COLOR_BORDER,
-            CANVAS_COLOR_PANEL_BG,
-            TUI_STYLE_NONE);
-    }
-
-    canvas_frame_put(
-        frame,
-        rect.x,
-        rect.y,
-        '+',
-        CANVAS_COLOR_BORDER,
-        CANVAS_COLOR_PANEL_BG,
-        TUI_STYLE_NONE);
-    canvas_frame_put(
-        frame,
-        rect.x + rect.w - 1,
-        rect.y,
-        '+',
-        CANVAS_COLOR_BORDER,
-        CANVAS_COLOR_PANEL_BG,
-        TUI_STYLE_NONE);
-    canvas_frame_put(
-        frame,
-        rect.x,
-        rect.y + rect.h - 1,
-        '+',
-        CANVAS_COLOR_BORDER,
-        CANVAS_COLOR_PANEL_BG,
-        TUI_STYLE_NONE);
-    canvas_frame_put(
-        frame,
-        rect.x + rect.w - 1,
-        rect.y + rect.h - 1,
-        '+',
-        CANVAS_COLOR_BORDER,
-        CANVAS_COLOR_PANEL_BG,
-        TUI_STYLE_NONE);
-
-    if (title != NULL && rect.w > 4) {
-        canvas_frame_text(
-            frame,
-            rect.x + 2,
-            rect.y,
-            title,
-            CANVAS_COLOR_TEXT,
-            CANVAS_COLOR_PANEL_BG,
-            TUI_STYLE_BOLD);
-    }
 }
 
 static void canvas_layout_compute(CanvasPage *state, TgSizei frame_size)
@@ -479,6 +308,29 @@ static TgResult canvas_page_new_document(CanvasPage *state)
     return TG_OK;
 }
 
+static TgResult canvas_page_save_document(CanvasPage *state)
+{
+    TgResult result = canvas_page_finalize_stroke(state);
+    if (tg_result_err(result)) {
+        return result;
+    }
+
+    result = canvas_document_save_json_file(
+        &state->canvas.document,
+        CANVAS_SAVE_PATH);
+
+    (void)snprintf(
+        state->status,
+        sizeof(state->status),
+        tg_result_ok(result)
+            ? "Saved: %s"
+            : "Save failed: %s",
+        CANVAS_SAVE_PATH);
+    state->frame_dirty = true;
+    /* An I/O failure is a page status, not a reason to terminate the app. */
+    return TG_OK;
+}
+
 static TgResult canvas_page_undo(CanvasPage *state)
 {
     bool changed =
@@ -520,12 +372,7 @@ static TgResult canvas_page_activate_button(
     case CANVAS_BUTTON_NEW:
         return canvas_page_new_document(state);
     case CANVAS_BUTTON_SAVE:
-        (void)snprintf(
-            state->status,
-            sizeof(state->status),
-            "Save is not implemented yet");
-        state->frame_dirty = true;
-        return TG_OK;
+        return canvas_page_save_document(state);
     case CANVAS_BUTTON_UNDO:
         return canvas_page_undo(state);
     case CANVAS_BUTTON_REDO:
@@ -867,7 +714,7 @@ static void canvas_page_draw_toolbar(
     canvas_page_draw_button(
         state, frame, CANVAS_BUTTON_NEW, "New", true);
     canvas_page_draw_button(
-        state, frame, CANVAS_BUTTON_SAVE, "Save", false);
+        state, frame, CANVAS_BUTTON_SAVE, "Save", true);
     canvas_page_draw_button(
         state,
         frame,

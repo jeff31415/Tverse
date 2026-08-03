@@ -25,6 +25,8 @@ typedef struct CanvasHistory {
     size_t operation_count;
 } CanvasHistory;
 
+#define CANVAS_DOCUMENT_MAX_REVISION ((uint64_t)INT64_MAX)
+
 typedef struct CanvasDocument {
     TgSizei output_size;
     CanvasHistory history;

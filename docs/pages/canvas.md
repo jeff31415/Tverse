@@ -4,8 +4,10 @@ The Canvas page is the first implemented `draw_app` page. Its public creation
 interface is in [`canvas_page.h`](../../canvas_page.h), its controller and
 page chrome are in [`canvas_page.c`](../../canvas_page.c). The linked-list
 document model is in [`canvas.h`](../../canvas.h) and
-[`canvas.c`](../../canvas.c); reusable stroke maintenance, projection and
-rendering are in [`canvas_state.h`](../../canvas_state.h) and
+[`canvas.c`](../../canvas.c), with persistence in
+[`canvas_json.h`](../../canvas_json.h) and
+[`canvas_json.c`](../../canvas_json.c); reusable stroke maintenance, projection
+and rendering are in [`canvas_state.h`](../../canvas_state.h) and
 [`canvas_state.c`](../../canvas_state.c). Their complete ownership, lifecycle
 and reuse contract is documented in
 [Reusable canvas state](../canvas-state.md).
@@ -23,17 +25,17 @@ The page implements:
 - an ASCII 32 through 126 character palette;
 - mouse press/drag drawing with the selected character;
 - linked-list operation history with undo, redo and replay;
-- a disabled Save action and placeholder additional tools.
+- JSON document dump/load and an enabled Save action;
+- placeholder additional tools.
 
-Saving, loading, output extraction, extra tools and palette editing are
-reserved for later work.
+Output extraction, extra tools and palette editing are reserved for later work.
 
 ## Page event and render flow
 
 ```mermaid
 flowchart TD
     Event["Ordered TuiInputEvent"] --> Kind{"Event kind"}
-    Kind -- "Ctrl command" --> Command["New, Save placeholder, Undo or Redo"]
+    Kind -- "Ctrl command" --> Command["New, Save, Undo or Redo"]
     Kind -- "plain ASCII" --> Select["Select matching palette character"]
     Kind -- "mouse" --> Hit{"Hit test"}
     Hit -- "palette" --> Select
@@ -135,7 +137,7 @@ animation or output generation.
 ### `CanvasOperation`
 
 `CanvasOperation` is deliberately opaque in `canvas.h` and defined privately
-in `canvas.c`. A node stores:
+in `canvas_internal.h`. A node stores:
 
 - a `CanvasOperationType`;
 - `prev` and `next` links;
@@ -148,8 +150,39 @@ the replay list without changing its ownership rules.
 ### `CanvasDocument`
 
 Owns the configured `output_size`, its `CanvasHistory`, and a monotonically
-increasing `revision`. Draft samples outside `output_size` remain in the same
-history and are not discarded.
+increasing `revision` in the inclusive range `0..INT64_MAX`. Revision updates
+saturate at `INT64_MAX`, and documents outside that range are invalid. Draft
+samples outside `output_size` remain in the same history and are not discarded.
+
+### JSON persistence
+
+`canvas_document_dump_json()` serializes every document field. `history.head`
+contains the oldest operation and each `next` field directly nests the newer
+operation until `null`. The reverse-only `prev`, `tail` and `cursor` pointers
+are stored as zero-based node references (or `null`) and rebuilt by
+`canvas_document_load_json()`.
+
+Both directions validate the full doubly linked chain. Cycles, broken `prev`
+links, mismatched `tail`/`operation_count`, invalid cursor references and sample
+count mismatches are rejected. `TuiCell.ch` is encoded as all eight bytes so a
+dump/load cycle does not lose embedded NUL or non-ASCII bytes.
+
+Three implementations are kept temporarily:
+
+| Implementation | Dump | Load | Notable limit |
+| --- | --- | --- | --- |
+| `canvas_json.c` | Project writer | Project parser | Revision at most `INT64_MAX`; nesting limit 4096 |
+| `canvas_json_cjson.c` | cJSON tree with raw integer nodes | cJSON parser | Parsed numbers at most `2^53 - 1`; default nesting limit 1000 |
+| `canvas_json_jansson.c` | Jansson tree | Jansson parser | Exact signed 64-bit integers; configured Jansson nesting limit |
+
+All dump functions produce byte-identical compact JSON, including field order,
+and the tests cross-load every implementation's output through all three
+loaders. The cJSON dump uses raw number nodes, so an `INT64_MAX` revision is
+emitted without precision loss; its load function returns
+`TG_ERR_UNSUPPORTED` rather than silently rounding values above its exact
+`double` range. The Canvas page's `Ctrl+S` currently uses the project
+implementation, while the cJSON and Jansson file APIs remain available for
+comparison.
 
 ## Reusable canvas state
 
@@ -261,7 +294,7 @@ palette but retains ASCII value 32.
 | `canvas_page_viewport` | Adapt current page layout to a reusable `CanvasViewport` |
 | `canvas_page_finalize_stroke` | Finalize through `CanvasState` and invalidate the page frame |
 | `canvas_page_handle_mouse` | Palette, toolbar and Canvas hit testing |
-| `canvas_page_new_document/undo/redo` | Implement document commands and status updates |
+| `canvas_page_new_document/save_document/undo/redo` | Implement document commands and status updates |
 
 Changing the selected character finalizes an active stroke first, ensuring one
 operation never mixes palette characters. All stroke allocation, interpolation
@@ -272,7 +305,7 @@ not maintain its own sample array.
 
 | Function group | Role |
 | --- | --- |
-| `canvas_frame_put/fill/text/box` | Bounds-checked page-frame primitives |
+| `canvas_frame_put/fill/text/box` | Shared bounds-checked primitives from `canvas_frame.c` |
 | `canvas_page_draw_canvas` | Box the panel and invoke `canvas_state_render` |
 | `canvas_page_draw_palette` | Render the ASCII grid and selection highlight |
 | `canvas_page_draw_toolbox` | Render the current Draw tool and future-tools placeholder |
@@ -293,7 +326,7 @@ into document history when a sample uses the default background color.
 | `Ctrl+N` | Reset the document |
 | `Ctrl+Z` | Finalize the current stroke, then undo |
 | `Ctrl+Y` | Finalize the current stroke, then redo |
-| `Ctrl+S` | Show the Save-not-implemented status |
+| `Ctrl+S` | Finalize a pending stroke and save `canvas.json` |
 | `F1`-`F9` | Leave the page and switch pages |
 
 Mouse release is accepted even outside the Canvas viewport. Drag samples

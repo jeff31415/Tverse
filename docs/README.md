@@ -53,7 +53,8 @@ shortcuts:
 - `Ctrl+Q`: exit.
 - `Ctrl+N`: reset the Canvas document.
 - `Ctrl+Z` / `Ctrl+Y`: Canvas undo / redo.
-- `Ctrl+S`: Canvas save reservation; saving is not implemented yet.
+- `Ctrl+S`: finalize the current stroke and save the Canvas document to
+  `canvas.json`.
 - Plain ASCII 32 through 126 on F2: select that palette character.
 
 ## Source map
@@ -64,6 +65,18 @@ shortcuts:
   helpers.
 - [`canvas.h`](../canvas.h) and [`canvas.c`](../canvas.c): centered document
   coordinates and operation history.
+- [`canvas_json.h`](../canvas_json.h) and
+  [`canvas_json.c`](../canvas_json.c): JSON dump/load and file persistence for
+  complete Canvas documents using the project parser.
+- [`canvas_json_cjson.h`](../canvas_json_cjson.h) and
+  [`canvas_json_cjson.c`](../canvas_json_cjson.c): schema-compatible cJSON
+  implementation retained for side-by-side comparison.
+- [`canvas_json_jansson.h`](../canvas_json_jansson.h) and
+  [`canvas_json_jansson.c`](../canvas_json_jansson.c): schema-compatible
+  Jansson implementation with exact signed 64-bit integers.
+- [`canvas_frame.h`](../canvas_frame.h) and
+  [`canvas_frame.c`](../canvas_frame.c): shared bounds-checked page-frame
+  drawing primitives.
 - [`canvas_state.h`](../canvas_state.h) and
   [`canvas_state.c`](../canvas_state.c): reusable pending-stroke lifecycle,
   interpolation, undo/redo facade, viewport projection and cell-buffer
@@ -75,5 +88,5 @@ shortcuts:
 - [`draw_app.conf.example`](../draw_app.conf.example): complete optional
   configuration example.
 
-Saving, loading, additional drawing tools and editable palettes remain outside
-the current implementation.
+Output extraction, additional drawing tools and editable palettes remain
+outside the current implementation.

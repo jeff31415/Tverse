@@ -1,5 +1,7 @@
 #include "canvas.h"
 
+#include "canvas_internal.h"
+
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,14 +13,6 @@
 #define free canvas_test_free
 #define malloc canvas_test_malloc
 #endif
-
-struct CanvasOperation {
-    CanvasOperationType type;
-    CanvasOperation *prev;
-    CanvasOperation *next;
-    CanvasSample *samples;
-    size_t sample_count;
-};
 
 static CanvasOperation *canvas_operation_find_cycle(
     CanvasOperation *operation)
@@ -74,8 +68,13 @@ static void canvas_operation_break_cycle(CanvasOperation *operation)
 
 static void canvas_document_touch(CanvasDocument *document)
 {
-    if (document != NULL && document->revision < UINT64_MAX) {
+    if (document == NULL) {
+        return;
+    }
+    if (document->revision < CANVAS_DOCUMENT_MAX_REVISION) {
         ++document->revision;
+    } else {
+        document->revision = CANVAS_DOCUMENT_MAX_REVISION;
     }
 }
 
@@ -133,6 +132,9 @@ TgResult canvas_document_commit_draw(
     size_t sample_count)
 {
     if (document == NULL || (sample_count > 0 && samples == NULL)) {
+        return TG_ERR_INVALID;
+    }
+    if (document->revision > CANVAS_DOCUMENT_MAX_REVISION) {
         return TG_ERR_INVALID;
     }
     if (canvas_operation_chain_has_cycle(document->history.head)) {
@@ -200,6 +202,7 @@ TgResult canvas_document_commit_draw(
 bool canvas_document_can_undo(const CanvasDocument *document)
 {
     return document != NULL &&
+           document->revision <= CANVAS_DOCUMENT_MAX_REVISION &&
            document->history.cursor != NULL &&
            !canvas_operation_chain_has_cycle(document->history.head);
 }
@@ -207,6 +210,7 @@ bool canvas_document_can_undo(const CanvasDocument *document)
 bool canvas_document_can_redo(const CanvasDocument *document)
 {
     if (document == NULL ||
+        document->revision > CANVAS_DOCUMENT_MAX_REVISION ||
         canvas_operation_chain_has_cycle(document->history.head)) {
         return false;
     }
@@ -247,6 +251,7 @@ void canvas_document_replay(
 {
     if (document == NULL ||
         replay == NULL ||
+        document->revision > CANVAS_DOCUMENT_MAX_REVISION ||
         document->history.cursor == NULL ||
         canvas_operation_chain_has_cycle(document->history.head)) {
         return;

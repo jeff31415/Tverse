@@ -1,7 +1,8 @@
 # draw_app
 
 `draw_app` is a page-oriented terminal drawing application. It uses the
-`tui` and `config` libraries from `corestack`, pinned as a Git submodule.
+`tui` and `config` libraries from `corestack` plus cJSON and Jansson; all three
+dependencies are pinned as Git submodules.
 
 ## Checkout
 
