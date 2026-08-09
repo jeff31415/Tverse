@@ -5,3 +5,4 @@ build_tests/
 compile_commands.json
 draw_app.conf
 *autosave.xopp
+design_drafts/*
