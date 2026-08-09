@@ -1,3 +1,4 @@
+/* Built-in Canvas JSON backend and file persistence. */
 #include "canvas_json.h"
 
 #include "canvas_internal.h"

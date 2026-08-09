@@ -1,5 +1,5 @@
-#ifndef DRAW_APP_CANVAS_H
-#define DRAW_APP_CANVAS_H
+#ifndef DRAW_APP_PLUGIN_CANVAS_H
+#define DRAW_APP_PLUGIN_CANVAS_H
 
 #include "tui.h"
 

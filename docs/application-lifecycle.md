@@ -1,177 +1,271 @@
-# Application lifecycle
+# Application and plugin lifecycle
 
-This document describes the `draw_app` process lifetime, per-frame loop and
-page callback contract. The declarations are in [`app.h`](../app.h), with the
-implementation in [`app.c`](../app.c) and [`main.c`](../main.c).
+The `draw_app` executable owns terminal access, timing, page selection,
+host-side surfaces and dynamic loading. Every page is a `MODULE` library and
+the host interacts with it only through the four functions in
+[`plugin.h`](../plugin.h). The exact function, type, ownership and result-code
+rules are defined by the [page plugin ABI contract](plugin-abi.md).
 
-## Main flow
+## Main loop
 
 ```mermaid
 flowchart TD
-    Config["Assign defaults and load optional config"] --> Init["app_init"]
-    Init --> Tui["Initialize TUI"]
-    Tui --> Pages["Register pages and allocate page frames"]
-    Pages --> Enter["Enter the initial page"]
-    Enter --> Begin["app_begin_frame: timing and input poll"]
-    Begin --> Dispatch["app_dispatch_events"]
-    Dispatch --> Stop{"Running?"}
-    Stop -- "yes" --> Update["app_update_active_page"]
-    Update --> Render["app_render_active_page"]
-    Render --> Compose["app_compose: page frame and footer"]
-    Compose --> Present["app_end_frame: present and rate limit"]
-    Present --> Begin
-    Stop -- "no or error" --> Shutdown["app_shutdown"]
-    Shutdown --> Restore["Destroy pages and restore terminal"]
+  Config["Assign defaults and load optional config"] --> Init["app_init"]
+  Init --> TUI["Initialize TUI"]
+  TUI --> Pages["Allocate page slots and load all modules"]
+  Pages --> Enter["ENTER initial page"]
+  Enter --> Reload["Poll canonical module stamps"]
+  Reload --> Poll["Poll TUI events"]
+  Poll --> Dispatch["Consume host commands and route page input"]
+  Dispatch --> Stop{"Still running?"}
+  Stop -- yes --> Tick["TICK active plugin"]
+  Tick --> Read["READ_FRAME into host surface"]
+  Read --> Compose["Copy surface and draw footer"]
+  Compose --> Present["Present, increment frame and rate limit"]
+  Present --> Reload
+  Stop -- no or error --> Shutdown["Leave active page and unload all modules"]
+  Shutdown --> Restore["Restore terminal"]
 ```
 
-Input is polled at the beginning of the frame. Events remain ordered, so a page
-switch takes effect before later events in the same input batch are delivered.
-The active page alone receives page events, updates and rendering calls.
+All ABI calls are synchronous on the main thread. Only the active page receives
+input, tick and frame-read calls. Inactive page instances remain loaded and
+preserve state until selected, reloaded or destroyed.
 
-## Page switching
+## Page slot ownership
+
+Each host-owned `Page` contains:
+
+| Field group | Owner | Purpose |
+| --- | --- | --- |
+| title, shortcut, module path | host | Footer and routing metadata |
+| config storage | host | Stable copy passed as borrowed `TgBytes` during entry |
+| `DrawPluginModule` | host/loader | `dlopen` handle, opaque instance, four resolved functions and generation path |
+| `DrawPluginSurface` | host | Persistent page-sized `TuiCell` allocation |
+| generation and file stamps | host | Automatic reload observation and retry suppression |
+| active and entered flags | host | Selection and lifecycle bookkeeping |
+
+The plugin owns only the concrete object behind `DrawPlugin *` and any
+resources reachable from it. It never receives `App *` or `Page *`.
+
+## Initialization and module entry
+
+`app_init` initializes TUI first, then `app_register_default_pages` creates all
+nine page slots. F2 loads `canvas_page.so`; F1 and F3-F9 each load a separate
+instance of `example_page.so`. Reusing one canonical module does not share
+plugin state because every slot gets its own generation copy and entry call.
 
 ```mermaid
 sequenceDiagram
-    participant TUI
-    participant App
-    participant Old as Old Page
-    participant New as New Page
+  participant Main
+  participant App
+  participant TUI
+  participant Loader
+  participant Plugin as each page module
 
-    TUI-->>App: plain F1-F9 key event
-    App->>Old: on_leave(PAGE_LEAVE_SWITCH)
-    Old-->>App: TG_OK
-    App->>App: update active index and flags
-    App->>New: on_enter()
-    New-->>App: TG_OK
-    App->>New: remaining ordered events
+  Main->>App: app_init(config)
+  App->>TUI: tui_init(screen size)
+  TUI-->>App: TG_OK
+  loop each page definition
+    App->>App: allocate surface and copy config
+    App->>Loader: module_open(path, DrawPluginOpenArgs)
+    Loader->>Plugin: draw_plugin_entry(args, out instance)
+    Plugin-->>Loader: TG_OK and DrawPlugin pointer
+    Loader-->>App: handle, functions and instance
+  end
+  App->>Plugin: write(ENTER, NULL) for page zero
+  Plugin-->>App: TG_OK
+  App-->>Main: initialized application
 ```
 
-Plain `F1` through `F9` are the only shortcuts without Control. Global
-`Ctrl+Q` stops the loop. Other unconsumed events are passed to the active
-page's `handle_event` callback.
+Entry creates an instance but does not activate it. The initial page receives
+enter only after all registrations succeed. If any allocation, load, symbol
+resolution or entry fails, `app_init` takes the common shutdown path and
+cleans up every previously created slot.
 
-## Principal structures
+## One active frame
 
-### `AppFrame`
+`main.c` invokes the application stages in a fixed order. The host polls for
+module changes before polling input, so a successful automatic reload is in
+place before that frame's events are dispatched.
 
-Owns the `TuiCell` array rendered by one page:
+```mermaid
+sequenceDiagram
+  participant Main
+  participant App
+  participant TUI
+  participant Plugin as active plugin
+  participant Surface as active page surface
 
-```c
-typedef struct AppFrame {
-    TgSizei size;
-    TuiCell *cells;
-} AppFrame;
+  Main->>App: app_begin_frame()
+  App->>App: poll reload stamps for every page
+  App->>TUI: tui_poll_events()
+  TUI-->>App: ordered events
+  Main->>App: app_dispatch_events()
+  loop each event not consumed by host
+    App->>Plugin: write(INPUT, event pointer)
+    Plugin-->>App: TgResult
+  end
+  Main->>App: app_update_active_page()
+  App->>Plugin: write(TICK, frame context pointer)
+  Plugin-->>App: TgResult
+  Main->>App: app_render_active_page()
+  App->>Plugin: read(FRAME, surface pointer)
+  Plugin->>Surface: draw changed cells
+  Plugin-->>App: TgResult
+  Main->>App: app_compose()
+  App->>Surface: copy cells to TUI back buffer
+  App->>TUI: draw global footer
+  Main->>App: app_end_frame()
+  App->>TUI: tui_present()
+  App->>App: increment frame index and rate limit
 ```
 
-Its height excludes the global one-row footer. Page code writes to this frame,
-not directly to `tui_get_buffer()`.
+Any error returned by input, tick, frame read or present breaks the main loop
+and proceeds to shutdown. `Ctrl+Q` sets the running flag false and skips tick
+and rendering for that frame.
 
-### `AppFrameContext`
+## Ordered input and page switching
 
-Carries per-frame values to page updates:
+The host consumes three classes of global input:
 
-| Field | Meaning |
-| --- | --- |
-| `frame_index` | Number of successfully presented frames |
-| `delta_time` | Monotonic seconds since the prior frame |
+- `Ctrl+Q` stops the application;
+- `Ctrl+R` forces reload of the active slot;
+- plain F1-F9 selects a page.
 
-### `PageOps`
+All other `TuiInputEvent` values go to the active plugin in original order. A
+switch occurs immediately within the event loop, so later events from the same
+TUI poll go to the new page.
 
-Defines the page lifecycle contract:
+```mermaid
+sequenceDiagram
+  participant TUI
+  participant Host
+  participant Old as old page plugin
+  participant New as new page plugin
 
-| Callback | Responsibility |
-| --- | --- |
-| `on_enter` | Activate the page and invalidate layout/render caches as needed |
-| `on_leave` | Finalize transient work before a switch or shutdown |
-| `handle_event` | Mutate page state from one ordered `TuiInputEvent` |
-| `update` | Perform time-based work without reading global input |
-| `render` | Produce `page->frame` from page state |
-| `destroy` | Release page-owned state; must tolerate partial initialization |
+  TUI-->>Host: function-key event
+  Host->>Old: write(LEAVE, SWITCH reason pointer)
+  alt old leave succeeds
+    Old-->>Host: TG_OK
+    Host->>Host: update active index and flags
+    Host->>New: write(ENTER, NULL)
+    alt new enter succeeds
+      New-->>Host: TG_OK
+      TUI-->>Host: later event from same batch
+      Host->>New: write(INPUT, event pointer)
+    else new enter fails
+      New-->>Host: error
+      Host->>Host: leave frame loop and shut down
+    end
+  else old leave fails
+    Old-->>Host: error
+    Host->>Host: abort switch and shut down
+  end
+```
 
-Callbacks that can fail return `TgResult`. A failure leaves the main loop
-through the common shutdown path.
+Page switching is not a snapshot transaction. A new-page enter failure is a
+normal frame error and does not re-enter the old page; shutdown follows.
 
-`PageLeaveReason` distinguishes a normal page switch from application
-shutdown, allowing a page to apply different transient-state policies later.
+## Reload transaction
 
-### `Page`
+Automatic reload compares canonical module modification time and size. A new
+stamp must be observed identically twice. Each changed stamp is attempted once
+until the canonical file changes again. `Ctrl+R` bypasses the stability wait
+for the active page.
 
-Combines metadata, lifecycle callbacks, its private display frame and opaque
-page state:
+The candidate is copied to a unique temporary generation, opened with
+`RTLD_NOW | RTLD_LOCAL`, resolved and entered before the old handle is closed.
 
-| Field | Meaning |
-| --- | --- |
-| `title`, `shortcut` | Footer label and associated F-key |
-| `active`, `entered` | Selection and lifecycle state |
-| `frame` | Private page display buffer |
-| `ops` | `PageOps` implementation |
-| `userdata` | Page-specific state, such as `CanvasPage` |
+```mermaid
+sequenceDiagram
+  participant Host
+  participant Loader
+  participant Old as current generation
+  participant New as candidate generation
 
-### `AppConfig`
+  Host->>Loader: module_open(canonical path, open args)
+  Loader->>New: dlopen and resolve four symbols
+  Loader->>New: draw_plugin_entry(args, out instance)
+  alt load, symbols or entry fail
+    Loader->>New: cleanup if a non-null instance exists
+    Loader->>New: dlclose and unlink generation
+    Loader-->>Host: error
+    Host->>Old: keep current instance unchanged
+  else candidate entry succeeds
+    Loader-->>Host: candidate module
+    alt page slot is active
+      Host->>New: write(ENTER, NULL)
+      alt candidate enter fails
+        New-->>Host: error
+        Host->>Loader: close candidate
+        Host->>Old: continue current instance unchanged
+      else candidate enter succeeds
+        New-->>Host: TG_OK
+        Host->>Old: write(LEAVE, RELOAD reason pointer)
+        Note over Host,Old: old leave is best effort during reload
+        Host->>Host: swap module and clear host surface
+        Host->>Loader: close old module
+        Loader->>Old: draw_plugin_cleanup(instance)
+        Loader->>Loader: dlclose and unlink old generation
+      end
+    else page slot is inactive
+      Host->>Host: swap module and clear host surface
+      Host->>Loader: close old module
+      Loader->>Old: draw_plugin_cleanup(instance)
+      Loader->>Loader: dlclose and unlink old generation
+    end
+  end
+```
 
-Contains terminal size, Canvas final-output size, FPS and footer height.
-`app_config_defaults()` establishes valid values before
-`app_config_load()` optionally replaces configured fields.
+A successful reload deliberately starts with fresh plugin state. There is no
+snapshot or restore ABI. Canvas JSON save files are explicit documents and are
+not automatic reload snapshots. A reload candidate failure is logged but does
+not stop the application.
 
-### `App`
+## Shutdown
 
-Owns the full process state:
+Only the active instance receives `DRAW_PLUGIN_LEAVE_SHUTDOWN`. The host then
+destroys every slot in reverse registration order, including instances that
+were loaded but never entered. TUI remains alive until all plugin cleanup has
+finished.
 
-- copied configuration and derived content size;
-- fixed array of up to nine `Page` objects;
-- current page index and running/TUI-ready flags;
-- frame counter and monotonic timing fields.
+```mermaid
+sequenceDiagram
+  participant Main
+  participant Host
+  participant Active as active plugin
+  participant Plugin as each plugin in reverse order
+  participant Loader
+  participant TUI
 
-## Principal functions
+  Main->>Host: app_shutdown()
+  opt active instance is entered
+    Host->>Active: write(LEAVE, SHUTDOWN reason pointer)
+    Active-->>Host: result ignored during shutdown
+  end
+  loop every page slot in reverse registration order
+    Host->>Loader: module_close(module)
+    Loader->>Plugin: draw_plugin_cleanup(instance)
+    Loader->>Loader: dlclose(handle) and unlink generation
+    Host->>Host: free config copy and surface cells
+  end
+  Host->>TUI: tui_shutdown()
+  Host-->>Main: shutdown complete
+```
 
-### Initialization and shutdown
+## Failure and lifetime rules
 
-| Function | Role |
-| --- | --- |
-| `app_config_defaults` | Assign all built-in configuration defaults |
-| `app_config_load` | Parse and validate an optional config file |
-| `app_init` | Zero the app, initialize TUI, register pages and enter page 0 |
-| `app_add_page` | Allocate a page frame and install its metadata and `PageOps` |
-| `app_shutdown` | Leave the active page, destroy pages in reverse order, then shut down TUI |
+1. Candidate reload errors retain the current generation; normal ABI-call
+   errors end the main loop.
+2. Cleanup always precedes `dlclose`, and no resolved function pointer is used
+   afterward.
+3. A plugin must support cleanup without enter and repeated enter/leave cycles.
+4. The host owns every exchanged payload and surface; the plugin borrows them
+   only for the current call.
+5. Undefined behavior in a plugin remains process-level undefined behavior.
+   The loader isolates bad build artifacts, not crashes or memory corruption.
+6. No plugin may call global TUI functions; the raw stdin callback is the only
+   host service in ABI v1.
 
-`app_shutdown()` is the common cleanup path for normal exit, frame errors and
-partial initialization failures. TUI shutdown occurs last so every page can
-finish while terminal services still exist.
-
-### Per-frame functions
-
-| Function | Role |
-| --- | --- |
-| `app_begin_frame` | Record timing and call `tui_poll_events()` |
-| `app_dispatch_events` | Handle global exit/page keys and route remaining ordered events |
-| `app_update_active_page` | Call the active page's `update` hook |
-| `app_render_active_page` | Call the active page's `render` hook |
-| `app_compose` | Copy the active page frame into the TUI back buffer and draw the footer |
-| `app_end_frame` | Present the TUI frame, increment the frame index and enforce target FPS |
-| `app_should_close` | Report whether the loop should stop |
-
-### Frame helpers
-
-`app_frame_clear()` resets a full page frame. `app_frame_draw_text()` writes
-bounds-checked single-width text into a page frame. Pages may add private
-drawing helpers when they need boxes, fills or specialized clipping.
-
-## Ownership and failure rules
-
-1. `App` owns every `Page`.
-2. Each `Page` owns its frame allocation.
-3. Page `userdata` is owned by the page's `destroy` callback.
-4. Page switching never destroys page state.
-5. The active page is left before any page is destroyed.
-6. Page destruction runs in reverse registration order.
-7. TUI is restored after all page-owned resources have been released.
-
-For F2, `CanvasPage` owns a `CanvasState`; that state owns both its pending
-sample allocation and the linked operation history. `CanvasRenderTarget`
-temporarily borrows `Page.frame.cells` during rendering and does not free or
-retain it. See [Reusable canvas state](canvas-state.md) for the complete nested
-ownership and lifecycle contract.
-
-The default registration table is in [`pages.c`](../pages.c). F2 installs the
-Canvas callbacks; the other pages currently use the no-op placeholder
-callbacks.
+The implementation rationale and future hardening list remain in
+[`plugin-hot-reload-plan.md`](plugin-hot-reload-plan.md).

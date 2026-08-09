@@ -3,6 +3,7 @@
 #include "app.h"
 #include "config.h"
 #include "pages.h"
+#include "plugin_frame.h"
 
 #include <errno.h>
 #include <limits.h>
@@ -10,6 +11,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#define APP_PLUGIN_STABLE_OBSERVATIONS 2u
 
 static int64_t app_now_ns(void)
 {
@@ -48,6 +51,30 @@ static bool app_frame_cell_count(TgSizei size, size_t *out_count)
     return true;
 }
 
+static size_t app_plugin_stdin_read(
+    void *userdata,
+    void *destination,
+    size_t capacity)
+{
+    (void)userdata;
+    return tui_stdin_read(destination, capacity);
+}
+
+static DrawPluginOpenArgs app_plugin_open_args(
+    App *app,
+    const Page *page)
+{
+    return (DrawPluginOpenArgs){
+        .abi_version = DRAW_PLUGIN_ABI_VERSION,
+        .frame_size = app->content_size,
+        .config = page->config,
+        .host = {
+            .userdata = app,
+            .stdin_read = app_plugin_stdin_read,
+        },
+    };
+}
+
 static TgResult app_config_read_positive_long(
     const Config *source,
     const char *directive,
@@ -80,7 +107,7 @@ static void app_update_active_flags(App *app)
 static TgResult app_set_active_page(
     App *app,
     size_t page_index,
-    PageLeaveReason leave_reason)
+    DrawPluginLeaveReason leave_reason)
 {
     if (app == NULL || page_index >= app->page_count) {
         return TG_ERR_INVALID;
@@ -92,8 +119,11 @@ static TgResult app_set_active_page(
 
     if (app->active_page < app->page_count) {
         Page *old_page = &app->pages[app->active_page];
-        if (old_page->entered && old_page->ops.on_leave != NULL) {
-            TgResult result = old_page->ops.on_leave(old_page, leave_reason);
+        if (old_page->entered) {
+            TgResult result = old_page->module.functions.write(
+                old_page->module.instance,
+                DRAW_PLUGIN_WRITE_LEAVE,
+                &leave_reason);
             if (tg_result_err(result)) {
                 return result;
             }
@@ -105,11 +135,12 @@ static TgResult app_set_active_page(
     app_update_active_flags(app);
 
     Page *new_page = &app->pages[page_index];
-    if (new_page->ops.on_enter != NULL) {
-        TgResult result = new_page->ops.on_enter(new_page);
-        if (tg_result_err(result)) {
-            return result;
-        }
+    TgResult result = new_page->module.functions.write(
+        new_page->module.instance,
+        DRAW_PLUGIN_WRITE_ENTER,
+        NULL);
+    if (tg_result_err(result)) {
+        return result;
     }
     new_page->entered = true;
     return TG_OK;
@@ -133,6 +164,132 @@ static bool app_event_is_plain_key(
            event->type == TUI_INPUT_KEY &&
            event->modifiers == TUI_MOD_NONE &&
            event->key == key;
+}
+
+static TgResult app_reload_page(
+    App *app,
+    Page *page,
+    DrawPluginFileStamp source_stamp)
+{
+    if (app == NULL || page == NULL) {
+        return TG_ERR_INVALID;
+    }
+
+    DrawPluginOpenArgs args = app_plugin_open_args(app, page);
+    DrawPluginModule candidate;
+    TgResult result = draw_plugin_module_open(
+        page->module_path,
+        &args,
+        &candidate);
+    if (tg_result_err(result)) {
+        return result;
+    }
+
+    if (page->entered) {
+        result = candidate.functions.write(
+            candidate.instance,
+            DRAW_PLUGIN_WRITE_ENTER,
+            NULL);
+        if (tg_result_err(result)) {
+            draw_plugin_module_close(&candidate);
+            return result;
+        }
+
+        DrawPluginLeaveReason reason = DRAW_PLUGIN_LEAVE_RELOAD;
+        TgResult leave_result = page->module.functions.write(
+            page->module.instance,
+            DRAW_PLUGIN_WRITE_LEAVE,
+            &reason);
+        if (tg_result_err(leave_result)) {
+            fprintf(stderr,
+                "draw_app: plugin leave failed during reload: %s (%d)\n",
+                page->title,
+                leave_result);
+        }
+    }
+
+    DrawPluginModule previous = page->module;
+    page->module = candidate;
+    page->loaded_stamp = source_stamp;
+    ++page->generation;
+    page->pending_valid = false;
+    page->attempted_valid = false;
+    page->pending_observations = 0;
+    plugin_frame_clear(&page->frame);
+    draw_plugin_module_close(&previous);
+    return TG_OK;
+}
+
+static void app_poll_page_reload(App *app, Page *page)
+{
+    DrawPluginFileStamp current;
+    if (tg_result_err(draw_plugin_file_stamp(page->module_path, &current))) {
+        return;
+    }
+
+    if (draw_plugin_file_stamp_equal(current, page->loaded_stamp)) {
+        page->pending_valid = false;
+        page->attempted_valid = false;
+        page->pending_observations = 0;
+        return;
+    }
+
+    if (page->attempted_valid &&
+        draw_plugin_file_stamp_equal(current, page->attempted_stamp)) {
+        return;
+    }
+
+    if (!page->pending_valid ||
+        !draw_plugin_file_stamp_equal(current, page->pending_stamp)) {
+        page->pending_stamp = current;
+        page->pending_valid = true;
+        page->pending_observations = 1;
+        return;
+    }
+
+    if (page->pending_observations < APP_PLUGIN_STABLE_OBSERVATIONS) {
+        ++page->pending_observations;
+    }
+    if (page->pending_observations < APP_PLUGIN_STABLE_OBSERVATIONS) {
+        return;
+    }
+
+    page->attempted_stamp = current;
+    page->attempted_valid = true;
+    TgResult result = app_reload_page(app, page, current);
+    if (tg_result_err(result)) {
+        fprintf(stderr,
+            "draw_app: plugin reload failed, keeping current page: %s (%d)\n",
+            page->title,
+            result);
+    }
+}
+
+static void app_poll_plugin_reloads(App *app)
+{
+    for (size_t i = 0; i < app->page_count; ++i) {
+        app_poll_page_reload(app, &app->pages[i]);
+    }
+}
+
+static void app_force_reload_active_page(App *app)
+{
+    if (app == NULL || app->active_page >= app->page_count) {
+        return;
+    }
+
+    Page *page = &app->pages[app->active_page];
+    DrawPluginFileStamp current;
+    TgResult result = draw_plugin_file_stamp(page->module_path, &current);
+    if (tg_result_ok(result)) {
+        result = app_reload_page(app, page, current);
+    }
+    if (tg_result_err(result)) {
+        fprintf(stderr,
+            "draw_app: forced plugin reload failed: %s (%d)\n",
+            page->title,
+            result);
+    }
 }
 
 static void app_draw_footer(App *app)
@@ -268,12 +425,13 @@ TgResult app_add_page(
     App *app,
     const char *title,
     TuiKey shortcut,
-    const PageOps *ops,
-    void *userdata)
+    const char *module_path,
+    TgBytes config)
 {
     if (app == NULL ||
         title == NULL ||
-        ops == NULL ||
+        module_path == NULL ||
+        (config.len > 0 && config.data == NULL) ||
         app->page_count >= APP_MAX_PAGES) {
         return TG_ERR_INVALID;
     }
@@ -288,20 +446,53 @@ TgResult app_add_page(
         return TG_ERR_NOMEM;
     }
 
+    uint8_t *config_storage = NULL;
+    if (config.len > 0) {
+        config_storage = malloc(config.len);
+        if (config_storage == NULL) {
+            free(cells);
+            return TG_ERR_NOMEM;
+        }
+        memcpy(config_storage, config.data, config.len);
+    }
+
     Page *page = &app->pages[app->page_count];
     *page = (Page){
         .title = title,
         .shortcut = shortcut,
+        .module_path = module_path,
         .active = app->page_count == app->active_page,
         .entered = false,
         .frame = {
             .size = app->content_size,
             .cells = cells,
         },
-        .ops = *ops,
-        .userdata = userdata,
+        .config_storage = config_storage,
+        .config = {
+            .data = config_storage,
+            .len = config.len,
+        },
     };
-    app_frame_clear(&page->frame);
+    plugin_frame_clear(&page->frame);
+
+    TgResult result = draw_plugin_file_stamp(
+        page->module_path,
+        &page->loaded_stamp);
+    if (tg_result_ok(result)) {
+        DrawPluginOpenArgs args = app_plugin_open_args(app, page);
+        result = draw_plugin_module_open(
+            page->module_path,
+            &args,
+            &page->module);
+    }
+    if (tg_result_err(result)) {
+        free(page->config_storage);
+        free(page->frame.cells);
+        memset(page, 0, sizeof(*page));
+        return result;
+    }
+
+    page->generation = 1;
     ++app->page_count;
     return TG_OK;
 }
@@ -340,7 +531,10 @@ TgResult app_init(App *app, const AppConfig *config)
     }
 
     app_update_active_flags(app);
-    result = app_set_active_page(app, app->active_page, PAGE_LEAVE_SWITCH);
+    result = app_set_active_page(
+        app,
+        app->active_page,
+        DRAW_PLUGIN_LEAVE_SWITCH);
     if (tg_result_err(result)) {
         app_shutdown(app);
         return result;
@@ -357,17 +551,22 @@ void app_shutdown(App *app)
 
     if (app->active_page < app->page_count) {
         Page *active = &app->pages[app->active_page];
-        if (active->entered && active->ops.on_leave != NULL) {
-            (void)active->ops.on_leave(active, PAGE_LEAVE_SHUTDOWN);
+        if (active->entered) {
+            DrawPluginLeaveReason reason = DRAW_PLUGIN_LEAVE_SHUTDOWN;
+            (void)active->module.functions.write(
+                active->module.instance,
+                DRAW_PLUGIN_WRITE_LEAVE,
+                &reason);
         }
         active->entered = false;
     }
 
     for (size_t i = app->page_count; i > 0; --i) {
         Page *page = &app->pages[i - 1u];
-        if (page->ops.destroy != NULL) {
-            page->ops.destroy(page);
-        }
+        draw_plugin_module_close(&page->module);
+        free(page->config_storage);
+        page->config_storage = NULL;
+        page->config = (TgBytes){0};
         free(page->frame.cells);
         page->frame.cells = NULL;
     }
@@ -390,6 +589,8 @@ TgResult app_begin_frame(App *app)
     if (app == NULL) {
         return TG_ERR_INVALID;
     }
+
+    app_poll_plugin_reloads(app);
 
     app->frame_start_ns = app_now_ns();
     if (app->last_frame_ns > 0 && app->frame_start_ns >= app->last_frame_ns) {
@@ -420,6 +621,10 @@ TgResult app_dispatch_events(App *app)
             app->running = false;
             return TG_OK;
         }
+        if (app_event_is_control_char(event, 'r')) {
+            app_force_reload_active_page(app);
+            continue;
+        }
 
         bool switched = false;
         for (size_t page_index = 0;
@@ -431,7 +636,7 @@ TgResult app_dispatch_events(App *app)
                 TgResult result = app_set_active_page(
                     app,
                     page_index,
-                    PAGE_LEAVE_SWITCH);
+                    DRAW_PLUGIN_LEAVE_SWITCH);
                 if (tg_result_err(result)) {
                     return result;
                 }
@@ -444,11 +649,12 @@ TgResult app_dispatch_events(App *app)
         }
 
         Page *active = &app->pages[app->active_page];
-        if (active->ops.handle_event != NULL) {
-            TgResult result = active->ops.handle_event(active, event);
-            if (tg_result_err(result)) {
-                return result;
-            }
+        TgResult result = active->module.functions.write(
+            active->module.instance,
+            DRAW_PLUGIN_WRITE_INPUT,
+            event);
+        if (tg_result_err(result)) {
+            return result;
         }
     }
     return TG_OK;
@@ -460,16 +666,17 @@ TgResult app_update_active_page(App *app)
         return TG_ERR_INVALID;
     }
 
-    AppFrameContext context = {
+    DrawPluginFrameContext context = {
         .frame_index = app->frame_index,
         .delta_time = app->delta_time,
+        .frame_size = app->content_size,
     };
 
     Page *active = &app->pages[app->active_page];
-    if (active->ops.update == NULL) {
-        return TG_OK;
-    }
-    return active->ops.update(active, &context);
+    return active->module.functions.write(
+        active->module.instance,
+        DRAW_PLUGIN_WRITE_TICK,
+        &context);
 }
 
 TgResult app_render_active_page(App *app)
@@ -479,10 +686,10 @@ TgResult app_render_active_page(App *app)
     }
 
     Page *active = &app->pages[app->active_page];
-    if (active->ops.render == NULL) {
-        return TG_OK;
-    }
-    return active->ops.render(active);
+    return active->module.functions.read(
+        active->module.instance,
+        DRAW_PLUGIN_READ_FRAME,
+        &active->frame);
 }
 
 void app_compose(App *app)
@@ -528,58 +735,4 @@ TgResult app_end_frame(App *app)
         }
     }
     return TG_OK;
-}
-
-void app_frame_clear(AppFrame *frame)
-{
-    if (frame == NULL || frame->cells == NULL) {
-        return;
-    }
-
-    size_t cell_count = 0;
-    if (!app_frame_cell_count(frame->size, &cell_count)) {
-        return;
-    }
-
-    TuiCell cell = app_default_cell();
-    for (size_t i = 0; i < cell_count; ++i) {
-        frame->cells[i] = cell;
-    }
-}
-
-void app_frame_draw_text(
-    AppFrame *frame,
-    int x,
-    int y,
-    const char *text,
-    uint32_t fg,
-    uint32_t bg,
-    uint16_t style)
-{
-    if (frame == NULL ||
-        frame->cells == NULL ||
-        text == NULL ||
-        y < 0 ||
-        y >= frame->size.h) {
-        return;
-    }
-
-    for (size_t i = 0; text[i] != '\0'; ++i) {
-        int draw_x = x + (int)i;
-        if (draw_x < 0) {
-            continue;
-        }
-        if (draw_x >= frame->size.w) {
-            break;
-        }
-
-        size_t index = (size_t)y * (size_t)frame->size.w + (size_t)draw_x;
-        TuiCell *cell = &frame->cells[index];
-        *cell = app_default_cell();
-        cell->ch[0] = text[i];
-        cell->ch[1] = '\0';
-        cell->fg = fg;
-        cell->bg = bg;
-        cell->style = style;
-    }
 }

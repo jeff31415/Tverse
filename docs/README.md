@@ -1,16 +1,20 @@
 # draw_app documentation
 
 `draw_app` is a page-oriented terminal application built on the low-level
-[`tui`](../deps/corestack/src/tui/README.md) backend. It currently provides nine F-key pages,
-an application-level page lifecycle, and an implemented Canvas page on F2.
+[`tui`](../deps/corestack/src/tui/README.md) backend. It provides nine F-key
+page slots loaded as hot-reloadable modules, with Canvas on F2 and a minimal
+example plugin serving as the other-page template.
 
 ## Documents
 
 | Document | Contents |
 | --- | --- |
-| [Application lifecycle](application-lifecycle.md) | Main loop, page switching, ownership, principal structures and application functions |
+| [Page plugin ABI](plugin-abi.md) | Normative four-function contract, exchanged types, ownership, operation payloads and active-frame sequence |
+| [Application lifecycle](application-lifecycle.md) | Initialization, frame dispatch, page switching, hot reload and shutdown sequence diagrams |
+| [`dlfcn` page plugin design](plugin-hot-reload-plan.md) | Design rationale, build split and remaining hardening work |
+| [Minimal example page](pages/example.md) | Template state, config bytes, four entry points, stdin callback and complete example sequence |
 | [Reusable canvas state](canvas-state.md) | Page-independent stroke lifecycle, history ownership, projection, rendering and reuse contract |
-| [Canvas page](pages/canvas.md) | F2 layout, input flow, coordinate system, operation history, rendering and page functions |
+| [Canvas page](pages/canvas.md) | Canvas ABI mapping, instance ownership, lifecycle sequence, input, history, JSON and rendering |
 
 The original Canvas design material is under
 [`design_drafts/canvas`](../design_drafts/canvas/).
@@ -51,6 +55,7 @@ shortcuts:
 
 - `F1` through `F9`: switch page.
 - `Ctrl+Q`: exit.
+- `Ctrl+R`: reload the active page module immediately.
 - `Ctrl+N`: reset the Canvas document.
 - `Ctrl+Z` / `Ctrl+Y`: Canvas undo / redo.
 - `Ctrl+S`: finalize the current stroke and save the Canvas document to
@@ -60,31 +65,46 @@ shortcuts:
 ## Source map
 
 - [`main.c`](../main.c): configuration selection, lifetime, and main loop.
-- [`app.h`](../app.h): page, frame, configuration, and application interfaces.
-- [`app.c`](../app.c): allocation, input dispatch, composition, timing, and frame
-  helpers.
-- [`canvas.h`](../canvas.h) and [`canvas.c`](../canvas.c): centered document
-  coordinates and operation history.
-- [`canvas_json.h`](../canvas_json.h) and
-  [`canvas_json.c`](../canvas_json.c): JSON dump/load and file persistence for
-  complete Canvas documents using the project parser.
-- [`canvas_json_cjson.h`](../canvas_json_cjson.h) and
-  [`canvas_json_cjson.c`](../canvas_json_cjson.c): schema-compatible cJSON
-  implementation retained for side-by-side comparison.
-- [`canvas_json_jansson.h`](../canvas_json_jansson.h) and
-  [`canvas_json_jansson.c`](../canvas_json_jansson.c): schema-compatible
-  Jansson implementation with exact signed 64-bit integers.
-- [`canvas_frame.h`](../canvas_frame.h) and
-  [`canvas_frame.c`](../canvas_frame.c): shared bounds-checked page-frame
+- [`app.h`](../app.h): plugin page slots, configuration and application
+  interfaces.
+- [`app.c`](../app.c): module lifecycle, reload polling, input dispatch,
+  composition and timing.
+- [`plugin.h`](../plugin.h): four-function page ABI and exchanged TUI types.
+- [`plugin-abi.md`](plugin-abi.md): normative function, payload, ownership and
+  lifecycle contract for that header.
+- [`plugin_loader.h`](../plugin_loader.h) and
+  [`plugin_loader.c`](../plugin_loader.c): generation copies, `dlopen`, symbol
+  resolution and unload.
+- [`plugins/canvas`](../plugins/canvas/): complete Canvas plugin source tree
+  and its local CMake targets.
+- [`canvas.h`](../plugins/canvas/canvas.h) and
+  [`canvas.c`](../plugins/canvas/canvas.c): centered document coordinates and
+  operation history.
+- [`canvas_json.h`](../plugins/canvas/canvas_json.h) and
+  [`canvas_json.c`](../plugins/canvas/canvas_json.c): JSON dump/load and file
+  persistence for complete Canvas documents using the project parser.
+- [`canvas_json_cjson.h`](../plugins/canvas/canvas_json_cjson.h) and
+  [`canvas_json_cjson.c`](../plugins/canvas/canvas_json_cjson.c):
+  schema-compatible cJSON implementation retained for side-by-side
+  comparison.
+- [`canvas_json_jansson.h`](../plugins/canvas/canvas_json_jansson.h) and
+  [`canvas_json_jansson.c`](../plugins/canvas/canvas_json_jansson.c):
+  schema-compatible Jansson implementation with exact signed 64-bit integers.
+- [`plugin_frame.h`](../plugin_frame.h) and
+  [`plugin_frame.c`](../plugin_frame.c): shared bounds-checked plugin-surface
   drawing primitives.
-- [`canvas_state.h`](../canvas_state.h) and
-  [`canvas_state.c`](../canvas_state.c): reusable pending-stroke lifecycle,
-  interpolation, undo/redo facade, viewport projection and cell-buffer
-  rendering.
-- [`canvas_page.h`](../canvas_page.h) and
-  [`canvas_page.c`](../canvas_page.c): F2 input, layout, palette and page chrome.
-- [`pages.c`](../pages.c): page registration and placeholder pages.
-- [`tests`](../tests/): document history, state, projection and rendering tests.
+- [`canvas_state.h`](../plugins/canvas/canvas_state.h) and
+  [`canvas_state.c`](../plugins/canvas/canvas_state.c): reusable pending-stroke
+  lifecycle, interpolation, undo/redo facade, viewport projection and
+  cell-buffer rendering.
+- [`canvas_page.h`](../plugins/canvas/canvas_page.h) and
+  [`canvas_page.c`](../plugins/canvas/canvas_page.c): Canvas ABI entry points,
+  input, layout, palette and page chrome.
+- [`examples/minimal_page_plugin`](../examples/minimal_page_plugin/): smallest
+  standalone page module and template.
+- [`pages.c`](../pages.c): host page metadata, module paths and config bytes.
+- [`tests`](../tests/): document, JSON, state, rendering and dynamic-loader
+  tests.
 - [`draw_app.conf.example`](../draw_app.conf.example): complete optional
   configuration example.
 

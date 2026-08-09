@@ -1,3 +1,4 @@
+/* Jansson-backed Canvas document serialization. */
 #include "canvas_json_jansson.h"
 
 #include "canvas_internal.h"

@@ -1,19 +1,151 @@
 # Canvas page (F2)
 
-The Canvas page is the first implemented `draw_app` page. Its public creation
-interface is in [`canvas_page.h`](../../canvas_page.h), its controller and
-page chrome are in [`canvas_page.c`](../../canvas_page.c). The linked-list
-document model is in [`canvas.h`](../../canvas.h) and
-[`canvas.c`](../../canvas.c), with persistence in
-[`canvas_json.h`](../../canvas_json.h) and
-[`canvas_json.c`](../../canvas_json.c); reusable stroke maintenance, projection
-and rendering are in [`canvas_state.h`](../../canvas_state.h) and
-[`canvas_state.c`](../../canvas_state.c). Their complete ownership, lifecycle
-and reuse contract is documented in
+Canvas is the stateful F2 implementation of the shared page-plugin ABI. Its
+four exported functions and page chrome live in
+[`canvas_page.c`](../../plugins/canvas/canvas_page.c). The linked-list document
+model is in [`canvas.h`](../../plugins/canvas/canvas.h) and
+[`canvas.c`](../../plugins/canvas/canvas.c), with persistence in
+[`canvas_json.h`](../../plugins/canvas/canvas_json.h) and
+[`canvas_json.c`](../../plugins/canvas/canvas_json.c); reusable stroke
+maintenance, projection and rendering are in
+[`canvas_state.h`](../../plugins/canvas/canvas_state.h) and
+[`canvas_state.c`](../../plugins/canvas/canvas_state.c). Their complete
+ownership, lifecycle and reuse contract is documented in
 [Reusable canvas state](../canvas-state.md).
 
 The original layout sketch is available as
 [`note_canvas_design.png`](../../design_drafts/canvas/note_canvas_design.png).
+
+The generic function signatures, payload lifetime and result-code rules are
+defined by the [page plugin ABI contract](../plugin-abi.md).
+
+## ABI binding and ownership
+
+`canvas_page.so` exports only `draw_plugin_entry`, `draw_plugin_cleanup`,
+`draw_plugin_write` and `draw_plugin_read`. The internal
+`canvas_page_create`, event, update and render functions are hidden behind
+those four calls.
+
+### Entry config
+
+Canvas defines its `TgBytes config` as exactly one binary `TgSizei`:
+
+```c
+TgSizei output_size = app->config.canvas_output_size;
+TgBytes config = {
+    .data = (const uint8_t *)&output_size,
+    .len = sizeof(output_size),
+};
+```
+
+This is distinct from `DrawPluginOpenArgs.frame_size`:
+
+| Value | Meaning |
+| --- | --- |
+| `args.frame_size` | Current terminal page area, excluding the global footer |
+| binary config `TgSizei` | Centered final-output width and height stored in the Canvas document |
+
+Entry rejects a null config, a length other than `sizeof(TgSizei)`, or any
+non-positive output/frame dimension. It initializes `CanvasState`, copies the
+host callback table and frame size, fills the ASCII palette and selects `#`.
+The current Canvas implementation retains the host callbacks for ABI
+consistency but does not call the raw stdin reader.
+
+### Instance ownership
+
+```text
+CanvasPage
+├── CanvasState
+│   ├── CanvasDocument
+│   │   └── CanvasHistory and owned operations/samples
+│   └── CanvasStroke pending samples
+├── CanvasPalette
+├── CanvasLayout
+├── copied DrawPluginHost and frame size
+└── transient mouse, dirty and status values
+```
+
+The plugin owns that complete tree. The host separately owns the
+`DrawPluginSurface` cells passed to frame reads. Cleanup destroys
+`CanvasState` and its recursively owned history before freeing `CanvasPage`;
+it does not require the instance to have received enter first.
+
+### Tagged operation mapping
+
+| ABI operation | Canvas implementation | Effect |
+| --- | --- | --- |
+| `ENTER` with `NULL` | `canvas_page_on_enter` | Compute layout, reveal palette selection and dirty the frame |
+| `LEAVE` with reason pointer | `canvas_page_on_leave` | Finalize a pending stroke for switch, reload or shutdown |
+| `INPUT` with event pointer | `canvas_page_handle_event` | Route commands, palette text and mouse actions |
+| `TICK` with frame context pointer | `canvas_page_update` | Track size and recompute layout after resize |
+| `FRAME` with surface pointer | `canvas_page_render` | Rebuild the borrowed surface only when dirty |
+
+Canvas validates every tag and required pointer. `LEAVE` also validates the
+reason range even though all three current reasons share the same stroke
+finalization behavior.
+
+### Canvas call sequence
+
+```mermaid
+sequenceDiagram
+  participant Host
+  participant ABI as Canvas ABI adapter
+  participant State as CanvasState
+  participant Doc as CanvasDocument
+  participant Surface as host-owned surface
+
+  Host->>ABI: entry(args with output-size config, out instance)
+  ABI->>State: canvas_state_init(output size)
+  State->>Doc: canvas_document_init(output size)
+  ABI-->>Host: TG_OK and CanvasPage instance
+  Host->>ABI: write(ENTER, NULL)
+  ABI->>ABI: compute layout and mark frame dirty
+  loop ordered active-page input
+    alt canvas mouse press
+      Host->>ABI: write(INPUT, mouse event pointer)
+      ABI->>State: begin_stroke(world position, selected cell)
+    else canvas mouse drag
+      Host->>ABI: write(INPUT, mouse event pointer)
+      ABI->>State: append_stroke(world position)
+    else mouse release or finalizing command
+      Host->>ABI: write(INPUT, event pointer)
+      ABI->>State: finalize_stroke()
+      State->>Doc: commit one DRAW_CELLS operation
+    else palette or command input
+      Host->>ABI: write(INPUT, event pointer)
+      ABI->>ABI: select, new, save, undo or redo
+    end
+  end
+  Host->>ABI: write(TICK, frame context pointer)
+  opt frame size changed
+    ABI->>ABI: recompute responsive layout
+  end
+  Host->>ABI: read(FRAME, surface pointer)
+  opt frame is dirty
+    ABI->>Surface: fill page and draw toolbox plus Canvas border
+    ABI->>State: canvas_state_render(target)
+    State->>Doc: replay operations from head through cursor
+    Doc-->>State: applied CanvasSample values
+    State->>Surface: draw backgrounds, history and pending stroke
+    ABI->>Surface: draw palette and toolbar
+  end
+  ABI-->>Host: TG_OK
+  Host->>ABI: write(LEAVE, reason pointer)
+  ABI->>State: finalize pending stroke if present
+  Note over Host,ABI: switches may later ENTER the same instance
+  Host->>ABI: cleanup(instance) on reload or shutdown
+  ABI->>State: canvas_state_destroy()
+```
+
+The surface is a persistent render cache. A clean frame read returns `TG_OK`
+without touching its cells. Input, layout changes and history changes mark the
+cache dirty.
+
+A successful hot reload creates a fresh `CanvasPage`; it does not transfer the
+document or pending stroke. `Ctrl+S` JSON persistence is explicit and remains
+independent from reload. The old active instance receives `LEAVE_RELOAD`
+before cleanup, which finalizes its pending stroke in memory but does not
+implicitly save it.
 
 ## Current scope
 
@@ -184,6 +316,33 @@ emitted without precision loss; its load function returns
 implementation, while the cJSON and Jansson file APIs remain available for
 comparison.
 
+The UI save path is synchronous:
+
+```mermaid
+sequenceDiagram
+  participant Host
+  participant Canvas as Canvas page
+  participant State as CanvasState
+  participant JSON as project JSON backend
+  participant File as canvas.json
+
+  Host->>Canvas: write(INPUT, Ctrl+S event pointer)
+  Canvas->>State: finalize_stroke()
+  opt a pending stroke exists
+    State->>State: commit pending samples into document history
+  end
+  Canvas->>JSON: canvas_document_save_json_file(document, path)
+  JSON->>JSON: validate chain and dump from oldest head through next
+  JSON->>File: write compact JSON bytes
+  File-->>JSON: I/O result
+  JSON-->>Canvas: TgResult
+  Canvas->>Canvas: update Saved or Save failed status
+  Canvas-->>Host: TG_OK unless stroke finalization failed
+```
+
+The public dump/load APIs support round trips and backend comparison, but the
+current page UI exposes save only; it does not bind a load command yet.
+
 ## Reusable canvas state
 
 `CanvasState` is independent of `Page`, `CanvasPage`, terminal input and the F2
@@ -265,12 +424,14 @@ the [`tests`](../../tests/) directory.
 
 ## Principal page functions
 
-### Public setup
+### Plugin ABI
 
 | Function | Role |
 | --- | --- |
-| `canvas_page_create` | Allocate the page, initialize the document and seed the ASCII palette |
-| `canvas_page_ops` | Return the `PageOps` callbacks installed by page registration |
+| `draw_plugin_entry` | Validate ABI/config, allocate Canvas state and seed the ASCII palette |
+| `draw_plugin_cleanup` | Destroy `CanvasState` and free plugin-owned state |
+| `draw_plugin_write` | Dispatch enter, leave, input and tick operations |
+| `draw_plugin_read` | Render a frame into the borrowed host surface |
 
 The initial selected character is `#`. Space is displayed as `SP` in the
 palette but retains ASCII value 32.
@@ -305,7 +466,7 @@ not maintain its own sample array.
 
 | Function group | Role |
 | --- | --- |
-| `canvas_frame_put/fill/text/box` | Shared bounds-checked primitives from `canvas_frame.c` |
+| `plugin_frame_put/fill/text/box` | Shared bounds-checked primitives from `plugin_frame.c` |
 | `canvas_page_draw_canvas` | Box the panel and invoke `canvas_state_render` |
 | `canvas_page_draw_palette` | Render the ASCII grid and selection highlight |
 | `canvas_page_draw_toolbox` | Render the current Draw tool and future-tools placeholder |

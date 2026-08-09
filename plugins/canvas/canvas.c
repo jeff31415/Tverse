@@ -1,3 +1,4 @@
+/* Canvas document and operation-history implementation. */
 #include "canvas.h"
 
 #include "canvas_internal.h"

@@ -43,14 +43,15 @@ target_link_libraries(draw_canvas_test_support PRIVATE draw_app_warnings)
 enable_draw_canvas_test_sanitizers(draw_canvas_test_support)
 
 add_library(draw_canvas_test_subject OBJECT
-    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_json.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_json_cjson.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_json_jansson.c"
-    "${CMAKE_CURRENT_SOURCE_DIR}/../canvas_state.c")
+    "${CMAKE_CURRENT_SOURCE_DIR}/../plugins/canvas/canvas.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../plugins/canvas/canvas_json.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../plugins/canvas/canvas_json_cjson.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../plugins/canvas/canvas_json_jansson.c"
+    "${CMAKE_CURRENT_SOURCE_DIR}/../plugins/canvas/canvas_state.c")
 target_compile_definitions(draw_canvas_test_subject PRIVATE CANVAS_TESTING=1)
 target_include_directories(draw_canvas_test_subject PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/.."
+    "${CMAKE_CURRENT_SOURCE_DIR}/../plugins/canvas"
     "${CMAKE_CURRENT_SOURCE_DIR}/../deps/cjson")
 target_link_libraries(draw_canvas_test_subject PRIVATE
     draw_app_warnings
@@ -63,7 +64,8 @@ function(add_draw_canvas_test target source)
         "${source}"
         $<TARGET_OBJECTS:draw_canvas_test_subject>)
     target_include_directories("${target}" PRIVATE
-        "${CMAKE_CURRENT_SOURCE_DIR}/..")
+        "${CMAKE_CURRENT_SOURCE_DIR}/.."
+        "${CMAKE_CURRENT_SOURCE_DIR}/../plugins/canvas")
     target_link_libraries("${target}" PRIVATE
         draw_app_warnings
         draw_canvas_test_support
@@ -128,6 +130,27 @@ add_draw_canvas_test(
 set_tests_properties(draw_canvas_test_history_cycle_destroy PROPERTIES
     LABELS "unit;hazardous"
     TIMEOUT 3)
+
+add_executable(draw_plugin_loader_test test_plugin_loader.c)
+target_compile_definitions(draw_plugin_loader_test PRIVATE
+    TEST_PLUGIN_PATH="$<TARGET_FILE:draw_page_example>"
+    TEST_CANVAS_PLUGIN_PATH="$<TARGET_FILE:draw_page_canvas>")
+target_link_libraries(draw_plugin_loader_test PRIVATE
+    draw_app_warnings
+    draw_canvas_unity
+    draw_plugin_loader)
+enable_draw_canvas_test_sanitizers(draw_plugin_loader_test)
+set_target_properties(draw_plugin_loader_test PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/tests")
+add_dependencies(
+    draw_plugin_loader_test
+    draw_page_example
+    draw_page_canvas)
+add_test(NAME draw_plugin_loader_test COMMAND draw_plugin_loader_test)
+set_tests_properties(draw_plugin_loader_test PROPERTIES
+    LABELS "unit;integration"
+    TIMEOUT 10)
+list(APPEND DRAW_CANVAS_TEST_TARGETS draw_plugin_loader_test)
 
 add_custom_target(
     draw_canvas_tests

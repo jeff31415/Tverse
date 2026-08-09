@@ -1,16 +1,18 @@
 # Reusable canvas state
 
-[`canvas_state.h`](../canvas_state.h) and
-[`canvas_state.c`](../canvas_state.c) provide the page-independent editing and
-rendering layer used by the F2 Canvas page. A different page can own a
+[`canvas_state.h`](../plugins/canvas/canvas_state.h) and
+[`canvas_state.c`](../plugins/canvas/canvas_state.c) provide the
+page-independent editing and rendering layer used by the F2 Canvas page. A
+different page can own a
 `CanvasState`, submit world-coordinate stroke points, and render the result
 into its own contiguous `TuiCell` buffer without depending on `Page`,
 `CanvasPage`, terminal input, or F2 layout code.
 
-The lower-level linked-list document remains in [`canvas.h`](../canvas.h) and
-[`canvas.c`](../canvas.c). `CanvasState` composes that history with the
-currently pending stroke and supplies the higher-level lifecycle used by page
-controllers.
+The lower-level linked-list document remains in
+[`canvas.h`](../plugins/canvas/canvas.h) and
+[`canvas.c`](../plugins/canvas/canvas.c). `CanvasState` composes that history
+with the currently pending stroke and supplies the higher-level lifecycle used
+by page controllers.
 
 ## Responsibility boundary
 

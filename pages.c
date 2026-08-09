@@ -1,54 +1,15 @@
 #include "pages.h"
 
-#include "canvas_page.h"
+#include <string.h>
 
-static TgResult simple_page_on_enter(Page *page)
-{
-    if (page == NULL) {
-        return TG_ERR_INVALID;
-    }
-    app_frame_clear(&page->frame);
-    return TG_OK;
-}
+#ifndef DRAW_APP_PLUGIN_DIR
+#define DRAW_APP_PLUGIN_DIR "plugins"
+#endif
 
-static TgResult simple_page_on_leave(
-    Page *page,
-    PageLeaveReason reason)
-{
-    (void)reason;
-    return page == NULL ? TG_ERR_INVALID : TG_OK;
-}
-
-static TgResult simple_page_handle_event(
-    Page *page,
-    const TuiInputEvent *event)
-{
-    return page == NULL || event == NULL ? TG_ERR_INVALID : TG_OK;
-}
-
-static TgResult simple_page_update(
-    Page *page,
-    const AppFrameContext *context)
-{
-    return page == NULL || context == NULL ? TG_ERR_INVALID : TG_OK;
-}
-
-static TgResult simple_page_render(Page *page)
-{
-    return page == NULL ? TG_ERR_INVALID : TG_OK;
-}
-
-static PageOps simple_page_ops(void)
-{
-    return (PageOps){
-        .on_enter = simple_page_on_enter,
-        .on_leave = simple_page_on_leave,
-        .handle_event = simple_page_handle_event,
-        .update = simple_page_update,
-        .render = simple_page_render,
-        .destroy = NULL,
-    };
-}
+#define DRAW_APP_CANVAS_PLUGIN \
+    DRAW_APP_PLUGIN_DIR "/canvas_page.so"
+#define DRAW_APP_EXAMPLE_PLUGIN \
+    DRAW_APP_PLUGIN_DIR "/example_page.so"
 
 TgResult app_register_default_pages(App *app)
 {
@@ -75,35 +36,29 @@ TgResult app_register_default_pages(App *app)
     for (size_t i = 0;
          i < sizeof(definitions) / sizeof(definitions[0]);
          ++i) {
-        PageOps ops = simple_page_ops();
-        void *userdata = NULL;
-
+        const char *module_path = definitions[i].canvas
+            ? DRAW_APP_CANVAS_PLUGIN
+            : DRAW_APP_EXAMPLE_PLUGIN;
+        TgBytes config;
         if (definitions[i].canvas) {
-            CanvasPage *canvas = NULL;
-            TgResult result = canvas_page_create(
-                app->config.canvas_output_size,
-                &canvas);
-            if (tg_result_err(result)) {
-                return result;
-            }
-            userdata = canvas;
-            ops = canvas_page_ops();
+            config = (TgBytes){
+                .data = (const uint8_t *)&app->config.canvas_output_size,
+                .len = sizeof(app->config.canvas_output_size),
+            };
+        } else {
+            config = (TgBytes){
+                .data = (const uint8_t *)definitions[i].title,
+                .len = strlen(definitions[i].title),
+            };
         }
 
         TgResult result = app_add_page(
             app,
             definitions[i].title,
             definitions[i].shortcut,
-            &ops,
-            userdata);
+            module_path,
+            config);
         if (tg_result_err(result)) {
-            if (definitions[i].canvas) {
-                Page temporary = {
-                    .ops = ops,
-                    .userdata = userdata,
-                };
-                ops.destroy(&temporary);
-            }
             return result;
         }
     }

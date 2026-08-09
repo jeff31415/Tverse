@@ -1,7 +1,7 @@
 #ifndef DRAW_APP_APP_H
 #define DRAW_APP_APP_H
 
-#include "tui.h"
+#include "plugin_loader.h"
 
 #include <stdbool.h>
 #include <stddef.h>
@@ -15,40 +15,25 @@
 #define APP_DEFAULT_FPS 30u
 #define APP_FOOTER_HEIGHT 1
 
-typedef struct AppFrame {
-    TgSizei size;
-    TuiCell *cells;
-} AppFrame;
-
-typedef struct AppFrameContext {
-    uint64_t frame_index;
-    double delta_time;
-} AppFrameContext;
-
 typedef struct Page Page;
-
-typedef enum PageLeaveReason {
-    PAGE_LEAVE_SWITCH = 0,
-    PAGE_LEAVE_SHUTDOWN
-} PageLeaveReason;
-
-typedef struct PageOps {
-    TgResult (*on_enter)(Page *page);
-    TgResult (*on_leave)(Page *page, PageLeaveReason reason);
-    TgResult (*handle_event)(Page *page, const TuiInputEvent *event);
-    TgResult (*update)(Page *page, const AppFrameContext *context);
-    TgResult (*render)(Page *page);
-    void (*destroy)(Page *page);
-} PageOps;
 
 struct Page {
     const char *title;
     TuiKey shortcut;
+    const char *module_path;
     bool active;
     bool entered;
-    AppFrame frame;
-    PageOps ops;
-    void *userdata;
+    DrawPluginSurface frame;
+    uint8_t *config_storage;
+    TgBytes config;
+    DrawPluginModule module;
+    DrawPluginFileStamp loaded_stamp;
+    DrawPluginFileStamp pending_stamp;
+    DrawPluginFileStamp attempted_stamp;
+    uint64_t generation;
+    unsigned pending_observations;
+    bool pending_valid;
+    bool attempted_valid;
 };
 
 typedef struct AppConfig {
@@ -90,17 +75,7 @@ TgResult app_add_page(
     App *app,
     const char *title,
     TuiKey shortcut,
-    const PageOps *ops,
-    void *userdata);
-
-void app_frame_clear(AppFrame *frame);
-void app_frame_draw_text(
-    AppFrame *frame,
-    int x,
-    int y,
-    const char *text,
-    uint32_t fg,
-    uint32_t bg,
-    uint16_t style);
+    const char *module_path,
+    TgBytes config);
 
 #endif

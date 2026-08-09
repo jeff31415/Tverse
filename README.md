@@ -1,8 +1,10 @@
 # draw_app
 
-`draw_app` is a page-oriented terminal drawing application. It uses the
-`tui` and `config` libraries from `corestack` plus cJSON and Jansson; all three
-dependencies are pinned as Git submodules.
+`draw_app` is a page-oriented terminal drawing application. The host loads
+Canvas and the example pages as hot-reloadable `.so` modules through a minimal
+four-function `dlfcn` ABI. It uses the `tui` and `config` libraries from
+`corestack` plus cJSON and Jansson; all three dependencies are pinned as Git
+submodules.
 
 ## Checkout
 
@@ -30,5 +32,14 @@ Run the application with:
 ./build/draw_app draw_app.conf.example
 ```
 
+The build places page modules under `build/plugins`. Press `Ctrl+R` to reload
+the active page immediately; changed module files are also detected between
+frames. [`examples/minimal_page_plugin`](examples/minimal_page_plugin/) is the
+small standalone template for a new page. The complete Canvas implementation
+lives under [`plugins/canvas`](plugins/canvas/); the repository root retains
+only host code and shared plugin infrastructure.
+
 See [`docs/README.md`](docs/README.md) for the architecture, controls and
-source guide.
+source guide. The current plugin contract is documented separately in
+[`docs/plugin-abi.md`](docs/plugin-abi.md), with lifecycle sequence diagrams in
+[`docs/application-lifecycle.md`](docs/application-lifecycle.md).

@@ -1,3 +1,4 @@
+/* cJSON-backed Canvas document serialization. */
 #include "canvas_json_cjson.h"
 
 #include "canvas_internal.h"

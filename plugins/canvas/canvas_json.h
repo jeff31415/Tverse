@@ -1,5 +1,5 @@
-#ifndef DRAW_APP_CANVAS_JSON_H
-#define DRAW_APP_CANVAS_JSON_H
+#ifndef DRAW_APP_PLUGIN_CANVAS_JSON_H
+#define DRAW_APP_PLUGIN_CANVAS_JSON_H
 
 #include "canvas.h"
 

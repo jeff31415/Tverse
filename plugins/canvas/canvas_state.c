@@ -1,3 +1,4 @@
+/* Canvas editing state, projection and cell-surface rendering. */
 #include "canvas_state.h"
 
 #include <stdlib.h>

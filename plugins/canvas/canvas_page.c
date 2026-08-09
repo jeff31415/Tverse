@@ -1,8 +1,9 @@
+/* Canvas page implementation of the shared plugin ABI. */
 #include "canvas_page.h"
 
-#include "canvas_frame.h"
 #include "canvas_json.h"
 #include "canvas_state.h"
+#include "plugin_frame.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,16 +53,18 @@ typedef struct CanvasLayout {
     int palette_visible_rows;
 } CanvasLayout;
 
-struct CanvasPage {
+typedef struct CanvasPage {
     CanvasState canvas;
     CanvasPalette palette;
     CanvasLayout layout;
+    DrawPluginHost host;
+    TgSizei frame_size;
     TgVec2i last_mouse_world;
     bool last_mouse_on_canvas;
     bool layout_dirty;
     bool frame_dirty;
     char status[96];
-};
+} CanvasPage;
 
 static bool canvas_rect_contains(TgRecti rect, int x, int y)
 {
@@ -484,39 +487,37 @@ static TgResult canvas_page_handle_mouse(
     return TG_OK;
 }
 
-static TgResult canvas_page_on_enter(Page *page)
+static TgResult canvas_page_on_enter(CanvasPage *state)
 {
-    if (page == NULL || page->userdata == NULL) {
+    if (state == NULL) {
         return TG_ERR_INVALID;
     }
 
-    CanvasPage *state = page->userdata;
-    canvas_layout_compute(state, page->frame.size);
+    canvas_layout_compute(state, state->frame_size);
     canvas_palette_reveal_selection(state);
     state->frame_dirty = true;
     return TG_OK;
 }
 
 static TgResult canvas_page_on_leave(
-    Page *page,
-    PageLeaveReason reason)
+    CanvasPage *state,
+    DrawPluginLeaveReason reason)
 {
     (void)reason;
-    if (page == NULL || page->userdata == NULL) {
+    if (state == NULL) {
         return TG_ERR_INVALID;
     }
-    return canvas_page_finalize_stroke(page->userdata);
+    return canvas_page_finalize_stroke(state);
 }
 
 static TgResult canvas_page_handle_event(
-    Page *page,
+    CanvasPage *state,
     const TuiInputEvent *event)
 {
-    if (page == NULL || page->userdata == NULL || event == NULL) {
+    if (state == NULL || event == NULL) {
         return TG_ERR_INVALID;
     }
 
-    CanvasPage *state = page->userdata;
     if (event->type == TUI_INPUT_KEY &&
         (event->modifiers & TUI_MOD_CONTROL) != 0) {
         switch (event->ch) {
@@ -553,19 +554,19 @@ static TgResult canvas_page_handle_event(
 }
 
 static TgResult canvas_page_update(
-    Page *page,
-    const AppFrameContext *context)
+    CanvasPage *state,
+    const DrawPluginFrameContext *context)
 {
-    (void)context;
-    if (page == NULL || page->userdata == NULL) {
+    if (state == NULL || context == NULL ||
+        context->frame_size.w <= 0 || context->frame_size.h <= 0) {
         return TG_ERR_INVALID;
     }
 
-    CanvasPage *state = page->userdata;
-    if (state->layout.frame_size.w != page->frame.size.w ||
-        state->layout.frame_size.h != page->frame.size.h ||
+    state->frame_size = context->frame_size;
+    if (state->layout.frame_size.w != state->frame_size.w ||
+        state->layout.frame_size.h != state->frame_size.h ||
         state->layout_dirty) {
-        canvas_layout_compute(state, page->frame.size);
+        canvas_layout_compute(state, state->frame_size);
         canvas_palette_reveal_selection(state);
     }
     return TG_OK;
@@ -573,9 +574,9 @@ static TgResult canvas_page_update(
 
 static TgResult canvas_page_draw_canvas(
     CanvasPage *state,
-    AppFrame *frame)
+    DrawPluginSurface *frame)
 {
-    canvas_frame_box(frame, state->layout.canvas_panel, "Canvas");
+    plugin_frame_box(frame, state->layout.canvas_panel, "Canvas");
 
     CanvasRenderTarget target = {
         .size = frame->size,
@@ -592,14 +593,14 @@ static TgResult canvas_page_draw_canvas(
 
 static void canvas_page_draw_toolbox(
     CanvasPage *state,
-    AppFrame *frame)
+    DrawPluginSurface *frame)
 {
     if (state->layout.toolbox_panel.w <= 0) {
         return;
     }
 
-    canvas_frame_box(frame, state->layout.toolbox_panel, "Tool Box");
-    canvas_frame_text(
+    plugin_frame_box(frame, state->layout.toolbox_panel, "Tool Box");
+    plugin_frame_text(
         frame,
         state->layout.toolbox_panel.x + 2,
         state->layout.toolbox_panel.y + 2,
@@ -607,7 +608,7 @@ static void canvas_page_draw_toolbox(
         CANVAS_COLOR_TEXT,
         CANVAS_COLOR_ACCENT,
         TUI_STYLE_BOLD);
-    canvas_frame_text(
+    plugin_frame_text(
         frame,
         state->layout.toolbox_panel.x + 2,
         state->layout.toolbox_panel.y + 4,
@@ -619,13 +620,13 @@ static void canvas_page_draw_toolbox(
 
 static void canvas_page_draw_palette(
     CanvasPage *state,
-    AppFrame *frame)
+    DrawPluginSurface *frame)
 {
     if (state->layout.palette_panel.w <= 0) {
         return;
     }
 
-    canvas_frame_box(frame, state->layout.palette_panel, "Palette");
+    plugin_frame_box(frame, state->layout.palette_panel, "Palette");
     int columns = state->layout.palette_columns;
     int first_row = state->palette.scroll_row;
     int last_row =
@@ -648,17 +649,17 @@ static void canvas_page_draw_palette(
         unsigned char ch = state->palette.items[index];
 
         if (ch == ' ') {
-            canvas_frame_put(
+            plugin_frame_put(
                 frame, x, y, 'S',
                 CANVAS_COLOR_TEXT, bg, style);
-            canvas_frame_put(
+            plugin_frame_put(
                 frame, x + 1, y, 'P',
                 CANVAS_COLOR_TEXT, bg, style);
         } else {
-            canvas_frame_put(
+            plugin_frame_put(
                 frame, x, y, ch,
                 CANVAS_COLOR_TEXT, bg, style);
-            canvas_frame_put(
+            plugin_frame_put(
                 frame, x + 1, y, ' ',
                 CANVAS_COLOR_TEXT, bg, style);
         }
@@ -667,7 +668,7 @@ static void canvas_page_draw_palette(
 
 static void canvas_page_draw_button(
     CanvasPage *state,
-    AppFrame *frame,
+    DrawPluginSurface *frame,
     CanvasButton button,
     const char *label,
     bool enabled)
@@ -681,13 +682,13 @@ static void canvas_page_draw_button(
         ? CANVAS_COLOR_TEXT
         : CANVAS_COLOR_DISABLED;
     uint16_t style = enabled ? TUI_STYLE_BOLD : TUI_STYLE_DIM;
-    canvas_frame_fill(
+    plugin_frame_fill(
         frame,
         rect,
         fg,
         CANVAS_COLOR_PANEL_BG,
         style);
-    canvas_frame_text(
+    plugin_frame_text(
         frame,
         rect.x + 1,
         rect.y,
@@ -699,13 +700,13 @@ static void canvas_page_draw_button(
 
 static void canvas_page_draw_toolbar(
     CanvasPage *state,
-    AppFrame *frame)
+    DrawPluginSurface *frame)
 {
     if (state->layout.toolbar.h <= 0) {
         return;
     }
 
-    canvas_frame_fill(
+    plugin_frame_fill(
         frame,
         state->layout.toolbar,
         CANVAS_COLOR_TEXT,
@@ -731,7 +732,7 @@ static void canvas_page_draw_toolbar(
     int status_x = state->layout.buttons[CANVAS_BUTTON_REDO].x +
                    state->layout.buttons[CANVAS_BUTTON_REDO].w + 1;
     if (status_x < frame->size.w) {
-        canvas_frame_text(
+        plugin_frame_text(
             frame,
             status_x,
             state->layout.toolbar.y,
@@ -742,54 +743,70 @@ static void canvas_page_draw_toolbar(
     }
 }
 
-static TgResult canvas_page_render(Page *page)
+static TgResult canvas_page_render(
+    CanvasPage *state,
+    DrawPluginSurface *surface)
 {
-    if (page == NULL || page->userdata == NULL) {
+    if (state == NULL || surface == NULL || surface->cells == NULL ||
+        surface->size.w <= 0 || surface->size.h <= 0) {
         return TG_ERR_INVALID;
     }
 
-    CanvasPage *state = page->userdata;
+    if (state->frame_size.w != surface->size.w ||
+        state->frame_size.h != surface->size.h ||
+        state->layout_dirty) {
+        state->frame_size = surface->size;
+        canvas_layout_compute(state, state->frame_size);
+        canvas_palette_reveal_selection(state);
+    }
     if (!state->frame_dirty) {
         return TG_OK;
     }
 
-    canvas_frame_fill(
-        &page->frame,
-        (TgRecti){0, 0, page->frame.size.w, page->frame.size.h},
+    plugin_frame_fill(
+        surface,
+        (TgRecti){0, 0, surface->size.w, surface->size.h},
         CANVAS_COLOR_TEXT,
         CANVAS_COLOR_PAGE_BG,
         TUI_STYLE_NONE);
-    canvas_page_draw_toolbox(state, &page->frame);
-    TgResult result = canvas_page_draw_canvas(state, &page->frame);
+    canvas_page_draw_toolbox(state, surface);
+    TgResult result = canvas_page_draw_canvas(state, surface);
     if (tg_result_err(result)) {
         return result;
     }
-    canvas_page_draw_palette(state, &page->frame);
-    canvas_page_draw_toolbar(state, &page->frame);
+    canvas_page_draw_palette(state, surface);
+    canvas_page_draw_toolbar(state, surface);
     state->frame_dirty = false;
     return TG_OK;
 }
 
-static void canvas_page_destroy(Page *page)
+static void canvas_page_destroy(CanvasPage *state)
 {
-    if (page == NULL || page->userdata == NULL) {
+    if (state == NULL) {
         return;
     }
 
-    CanvasPage *state = page->userdata;
     canvas_state_destroy(&state->canvas);
     free(state);
-    page->userdata = NULL;
 }
 
-TgResult canvas_page_create(
-    TgSizei output_size,
+static TgResult canvas_page_create(
+    const DrawPluginOpenArgs *args,
     CanvasPage **out_page)
 {
-    if (out_page == NULL) {
+    if (args == NULL || out_page == NULL ||
+        args->frame_size.w <= 0 || args->frame_size.h <= 0 ||
+        args->config.data == NULL ||
+        args->config.len != sizeof(TgSizei)) {
         return TG_ERR_INVALID;
     }
     *out_page = NULL;
+
+    TgSizei output_size;
+    memcpy(&output_size, args->config.data, sizeof(output_size));
+    if (output_size.w <= 0 || output_size.h <= 0) {
+        return TG_ERR_INVALID;
+    }
 
     CanvasPage *state = calloc(1, sizeof(*state));
     if (state == NULL) {
@@ -808,6 +825,8 @@ TgResult canvas_page_create(
     }
     state->palette.selected_index =
         (size_t)('#' - CANVAS_PALETTE_FIRST);
+    state->host = args->host;
+    state->frame_size = args->frame_size;
     state->layout_dirty = true;
     state->frame_dirty = true;
     (void)snprintf(
@@ -819,14 +838,87 @@ TgResult canvas_page_create(
     return TG_OK;
 }
 
-PageOps canvas_page_ops(void)
+TgResult draw_plugin_entry(
+    const DrawPluginOpenArgs *args,
+    DrawPlugin **out_plugin)
 {
-    return (PageOps){
-        .on_enter = canvas_page_on_enter,
-        .on_leave = canvas_page_on_leave,
-        .handle_event = canvas_page_handle_event,
-        .update = canvas_page_update,
-        .render = canvas_page_render,
-        .destroy = canvas_page_destroy,
-    };
+    if (out_plugin == NULL) {
+        return TG_ERR_INVALID;
+    }
+    *out_plugin = NULL;
+    if (args == NULL) {
+        return TG_ERR_INVALID;
+    }
+    if (args->abi_version != DRAW_PLUGIN_ABI_VERSION) {
+        return TG_ERR_UNSUPPORTED;
+    }
+
+    CanvasPage *state = NULL;
+    TgResult result = canvas_page_create(args, &state);
+    if (tg_result_ok(result)) {
+        *out_plugin = (DrawPlugin *)state;
+    }
+    return result;
+}
+
+void draw_plugin_cleanup(DrawPlugin *plugin)
+{
+    canvas_page_destroy((CanvasPage *)plugin);
+}
+
+TgResult draw_plugin_write(
+    DrawPlugin *plugin,
+    DrawPluginWriteKind kind,
+    const void *data)
+{
+    CanvasPage *state = (CanvasPage *)plugin;
+    if (state == NULL) {
+        return TG_ERR_INVALID;
+    }
+
+    switch (kind) {
+    case DRAW_PLUGIN_WRITE_ENTER:
+        return data == NULL
+            ? canvas_page_on_enter(state)
+            : TG_ERR_INVALID;
+    case DRAW_PLUGIN_WRITE_LEAVE: {
+        if (data == NULL) {
+            return TG_ERR_INVALID;
+        }
+        DrawPluginLeaveReason reason =
+            *(const DrawPluginLeaveReason *)data;
+        if (reason < DRAW_PLUGIN_LEAVE_SWITCH ||
+            reason > DRAW_PLUGIN_LEAVE_SHUTDOWN) {
+            return TG_ERR_INVALID;
+        }
+        return canvas_page_on_leave(state, reason);
+    }
+    case DRAW_PLUGIN_WRITE_INPUT:
+        return data != NULL
+            ? canvas_page_handle_event(
+                state,
+                (const TuiInputEvent *)data)
+            : TG_ERR_INVALID;
+    case DRAW_PLUGIN_WRITE_TICK:
+        return data != NULL
+            ? canvas_page_update(
+                state,
+                (const DrawPluginFrameContext *)data)
+            : TG_ERR_INVALID;
+    default:
+        return TG_ERR_INVALID;
+    }
+}
+
+TgResult draw_plugin_read(
+    DrawPlugin *plugin,
+    DrawPluginReadKind kind,
+    void *data)
+{
+    if (kind != DRAW_PLUGIN_READ_FRAME) {
+        return TG_ERR_INVALID;
+    }
+    return canvas_page_render(
+        (CanvasPage *)plugin,
+        (DrawPluginSurface *)data);
 }

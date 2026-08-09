@@ -1,5 +1,5 @@
-#ifndef DRAW_APP_CANVAS_STATE_H
-#define DRAW_APP_CANVAS_STATE_H
+#ifndef DRAW_APP_PLUGIN_CANVAS_STATE_H
+#define DRAW_APP_PLUGIN_CANVAS_STATE_H
 
 #include "canvas.h"
 
