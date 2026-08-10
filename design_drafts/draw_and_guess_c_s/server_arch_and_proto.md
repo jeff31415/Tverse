@@ -1,678 +1,1603 @@
-# Draw-and-guess 联机协议、服务器与 SDK 设计草案
+# Server/Client architecture and protocol
 
-状态：proposed，尚未冻结为兼容性契约。
+状态：v1 设计草案。本文先冻结模块边界、线程入口、主要数据结构和 SDK 契约；实现尚未开始。
 
-本文把原笔记中的方向收敛为一套可分阶段实现的 v1 方案。核心原则保持不变：
+设计输入：
 
-- fd/连接不是用户身份；只有认证成功后生成的可信 principal 才能映射到 uid；
-- 传输与网关层不解释具体游戏 payload，游戏语义只存在于 game-room 模块；
-- TLS 由 nginx 等边缘代理终止；应用层不重复加密 payload；
-- 跨层只传明确拥有权的消息，不让 socket、fd 或可变房间状态跨线程共享；
-- 服务端是最终权威，客户端的 uid、房间成员身份、画板 revision 都不能直接信任。
+- [Server_Client _arch_draft_new.md](<Server_Client _arch_draft_new.md>)
+- [arch_sketch.png](arch_sketch.png)
 
-## 1. 先修正原始数据流
+## 1. 已确认的 v1 决策
 
-原笔记中的入站顺序是：
+1. Networking 和 Gateway 是同一个 `epoll` 线程内的两个模块，当前优先降低复杂性。
+2. 每个 authenticated packet 都携带 UID；Gateway 每包检查 connection、UID、identity handle
+   和 sequence 的映射，任何不一致都直接踢出。
+3. 一个 UID 同时只允许绑定一个 active connection。出现重复 active binding 时撤销该 UID，并把
+   两个 connection 全部踢掉。
+4. 一个 UID 可以同时加入多个 Game room；demo 暂时只使用一个。
+5. Lobby 不持有 Gateway mapping 指针，只使用统一的 `GatewayRoomRequest` API 请求列房、创建、
+   加入和离开房间。Lobby 与 main/control 共用一条专用 MPSC request queue 和一把 queue mutex。
+6. room input header 包含 `JOIN/LOST/RESUMED/REMOVED` 等 lifecycle kind；游戏可以选择使用或
+   忽略这些事件。
+7. Game module reload 只有两种模式：立即把用户踢出受影响 room、返回 Lobby 并结束这些 room 后
+   reload；或者禁止新建及加入旧-generation room，无 deadline 地等待现有房间全部自然退出后
+   reload。
+8. demo 的 client SDK 和 server 都使用 raw TCP，不实现 TLS。部署时必须在此边界外补 TLS。
+9. demo identity 使用随机 identity handle，并维护 client-to-server/server-to-client 两个 sequence；
+   不使用 timestamp 或 HMAC。
+10. 公网 SDK header 固定 64 字节、整数全部 big-endian，使用固定 offset codec，不引入通用 parser。
+11. Auth handler 是同进程 thread，不查数据库、不验证账号；login 直接分配随机 UID 和随机
+    identity handle。意外断线后，同 UID/handle 可在 60 秒内 resume；成功后轮换 handle。超时或
+    logout 后 UID 失效。
+12. 每个 room instance 暂时使用一个线程，room entry 自行维护循环、周期和游戏状态。
+13. Game room 是动态库，只导出一个长生命周期入口函数；业务 payload 对 Gateway 完全 opaque。
+14. UID-room、live room route 和 template accepting 状态的跨线程变更全部抽象为
+    `GatewayRoomRequest`；Gateway 仍是唯一执行者和 mapping 写者。
 
-```text
-fd -> epoll -> buffer -> protobuf decode -> key verification -> route -> room
-```
+### 1.1 Demo 安全边界
 
-建议改为：
+v1 demo 不使用 TLS，也不使用 HMAC。identity handle 是一个 128-bit 随机 bearer capability，
+不是数字签名。Gateway 的逐包绑定检查能阻止不知道 handle 的客户端随意声明另一个 UID，但无法
+抵御能监听或修改 raw TCP 的攻击者。
 
-```text
-fd -> epoll -> length/header bounds check -> session lookup -> HMAC verify
-   -> sequence check -> control decode or opaque game routing
-   -> membership authorization -> room mailbox
-```
+因此：
 
-原因是 protobuf 及游戏 payload 都属于未认证输入。除了解出固定长度头中定位 session
-所必需的字段外，不应在校验 MAC 和大小限制前解析复杂结构。
+- raw TCP 只能用于本机、隔离开发网络或明确接受风险的 demo；
+- public deployment 必须在 client 与 nginx 之间启用 TLS；
+- nginx 到 Gateway 可按既定信任模型使用 loopback raw TCP；
+- 若以后需要不信任 nginx，再单独增加端到端认证/MAC，不改变 Game-room payload 协议。
 
-另外有三处需要明确调整：
-
-1. 普通数据帧不需要 timestamp 参与防重放。新鲜的 session id、分方向单调 sequence
-   和密钥轮换已经足够；timestamp 会引入客户端时钟漂移问题。时间只用于 token 过期、
-   日志和遥测。
-2. 不建议永久采用“一房间一线程”。房间应是单线程 actor，但多个 room actor 固定分片到
-   有限数量的 room worker；小规模部署可以先只启动一个 worker。
-3. `uid -> room` 不是单值映射。应保存 session、principal、membership 三层关系，以支持
-   同一用户重连、多设备以及以后可能加入的旁观者。
-
-## 2. 范围和非目标
-
-v1 要解决：
-
-- 原生 C 客户端通过 TLS TCP 长连接认证、进大厅、加入房间和收发游戏消息；
-- 非阻塞服务端能承受慢连接、半包、粘包、断线和插件热重载；
-- 网关验证身份并路由，但把游戏 payload 当作 opaque bytes；
-- 房间逻辑通过一个与 socket、TLS、HMAC、epoll 无关的 C SDK 实现；
-- 客户端 SDK 与 `draw_app` 宿主集成，网络连接不归某个可热重载页面所有；
-- 断线重连后通过事件重放或快照恢复当前房间视图。
-
-v1 暂不解决：
-
-- 跨进程房间迁移、跨机器一致性和无停机升级；
-- 服务端 game-room 动态热重载及房间状态迁移；
-- UDP、QUIC、语音和大文件传输；
-- 在应用层再次加密游戏 payload；
-- 崩溃后恢复进行中的临时房间，除非后续确认这是需求。
-
-## 3. 信任模型和术语
-
-| 名称 | 含义 | 不能替代什么 |
-| --- | --- | --- |
-| connection | 一个 TCP 流及 reactor 内状态 | 不是 uid，也不是 membership |
-| connection handle | `{reactor_id, slot, generation}` | 不能只保存 fd，避免 fd 复用误投递 |
-| principal | 认证层产生的可信 uid/角色集合 | 不能从游戏 payload 读取 |
-| session | 每次认证或恢复生成的新 session id、密钥和双向 sequence | 不等于永久账号 |
-| membership | principal/session 获准参与某 room 的记录 | 不能由客户端自行声明 |
-| room | 单 worker 串行执行的游戏 actor | 不拥有 fd，不直接调用 socket |
-| game payload | `protocol_id` 指定的 opaque bytes | 网关不解析其游戏字段 |
-
-nginx 终止 TLS 意味着 nginx 能看到明文和认证阶段发放的 session secret。因此 v1 的
-HMAC 可以提供帧完整性、session 绑定和防重放，但不能防御恶意或已失陷的 TLS 代理。
-如果威胁模型要求 nginx 也看不到 session secret，就必须改成 TLS passthrough，或者在
-应用协议内增加 X25519/HKDF 一类的端到端密钥协商。
-
-边缘代理必须为每个客户端保留独立、长生命周期、有序的 upstream byte stream，不能把多个
-客户端复用到同一应用层流。可选的 PROXY protocol v2 地址只用于审计和限流，绝不能作为 uid。
-
-HMAC 也不能代替授权。合法客户端知道自己的 session key，仍可能发送恶意但 MAC 正确的
-命令；房间必须校验“当前阶段、当前 drawer、坐标范围、速率和 payload 上限”。
-
-## 4. 总体架构
+## 2. 总体架构
 
 ```mermaid
-flowchart LR
-  subgraph ClientProcess["draw_app 客户端进程"]
-    Page["页面插件"]
-    Adapter["宿主 bus adapter"]
-    ClientSdk["libdg_client"]
-    Page <--> Adapter
-    Adapter <--> ClientSdk
+flowchart TD
+  GameClient["Game client logic"]
+  ClientSdk["client_sdk.c / client_sdk.h"]
+  Edge["Optional nginx TLS in deployment"]
+
+  subgraph GatewayThread["One Gateway epoll thread"]
+    Network["Networking: accept + complete frame I/O"]
+    Route["Gateway: validate + route"]
+    ConnMap["Connection/session table"]
+    IdentityMap["UID -> identity binding"]
+    MembershipMap["UID <-> room/player memberships"]
+    RoomRegistry["Live room routing table"]
+    RoomRequests["GatewayRoomRequest MPSC queue"]
+    Network <--> Route
+    Route <--> ConnMap
+    Route <--> IdentityMap
+    Route <--> MembershipMap
+    Route <--> RoomRegistry
+    Route <--> RoomRequests
   end
 
-  Edge["nginx TLS edge"]
-
-  subgraph ServerProcess["联机服务器进程"]
-    Acceptor["acceptor"]
-    Reactor["N 个 epoll reactor"]
-    Gateway["gateway session + routing"]
-    Auth["auth provider"]
-    Directory["room directory + membership"]
-    Lobby["lobby service actor"]
-    Workers["M 个 room worker"]
-    Rooms["多个 room actor"]
-    Reactor <--> Gateway
-    Gateway <--> Auth
-    Gateway <--> Directory
-    Directory <--> Lobby
-    Directory <--> Workers
-    Workers <--> Rooms
+  subgraph MainControl["Server main/control owner"]
+    RoomManager["Room/thread manager"]
+    Loader["dlopen generation loader"]
+    RoomManager <--> Loader
   end
 
+  subgraph PrivilegedThreads["Privileged server threads"]
+    Auth["Auth handler thread"]
+    Lobby["Lobby thread"]
+  end
+
+  subgraph DynamicRooms["Dynamic room threads"]
+    RoomA["Room instance A"]
+    RoomB["Room instance B"]
+    RoomN["Room instance N"]
+  end
+
+  Config["TOML module configuration"]
+
+  GameClient <--> ClientSdk
   ClientSdk <--> Edge
-  Edge <--> Acceptor
-  Acceptor --> Reactor
-  Rooms --> Reactor
+  Edge <--> Network
+  Route <--> Auth
+  Route <--> Lobby
+  Route <--> RoomA
+  Route <--> RoomB
+  Route <--> RoomN
+  Route <--> RoomManager
+  Lobby --> RoomRequests
+  RoomManager --> RoomRequests
+  Config --> Loader
+  Loader --> RoomA
+  Loader --> RoomB
+  Loader --> RoomN
 ```
 
-### 4.1 线程和所有权
+在 demo 不启用 nginx 时，`ClientSdk <--> Edge <--> Network` 退化为 Client SDK 直接 raw TCP
+连接 Gateway listener。
 
-| 组件 | 数量 | 独占状态 | 与其他线程交换的内容 |
-| --- | --- | --- | --- |
-| acceptor | 1 | listen fd | 新 connection handle/fd，移交后不再访问 |
-| I/O reactor | CPU/负载配置 | client fd、读写状态、session MAC/seq、连接发送队列 | 已验证入站消息、房间产生的出站消息 |
-| auth worker/provider | 1 或小池 | token/key 查询上下文 | auth request/result，不接触 fd |
-| directory shard | 1 起步 | room 到 worker、principal/session 到 membership | join/leave/route request |
-| room worker | 固定 M 个 | 分配给自己的全部 room actor | 有界 mailbox 中的 owned message |
-| room actor | 每房间一个对象 | 游戏状态、参与者、事件序号、重放窗口 | 只在所属 worker 回调中访问 |
+### 2.1 线程入口
 
-关键约束：
-
-- fd 只能由所属 reactor 访问；room 发消息时使用带 generation 的 connection handle；
-- room state 只能由所属 worker 访问，因此房间逻辑通常不需要 mutex；
-- 每次跨线程 enqueue 都明确转移 payload ownership，队列失败时由发送方释放；
-- reactor 和 worker 之间使用 bounded MPSC mailbox，并用 `eventfd` 唤醒；
-- 不在每层重复拼接和复制 header。进程内使用 metadata + owned byte span，只有写入公网
-  wire 时才编码 envelope。
-
-“每房间一线程”在少量房间时容易实现，但会让线程数、栈内存、调度开销和关闭流程随房间
-数量增长。actor-per-room + fixed worker pool 保留相同的串行逻辑模型，又不把线程作为 SDK
-契约暴露。
-
-### 4.2 入站消息生命周期
-
-```mermaid
-sequenceDiagram
-  participant C as Client SDK
-  participant R as I/O reactor
-  participant G as Gateway
-  participant D as Directory
-  participant W as Room worker
-  participant M as Game room
-
-  C->>R: length prefix + header + payload + MAC
-  R->>R: bounds check and collect complete frame
-  R->>G: fixed header and raw authenticated bytes
-  G->>G: session lookup, HMAC and sequence verification
-  alt control protocol
-    G->>G: decode protobuf control payload
-    G->>D: authenticated control request
-  else room game protocol
-    G->>D: authorize membership and resolve worker
-    D-->>G: worker id and trusted membership
-    G->>W: enqueue principal + route metadata + opaque payload
-    W->>M: serialized on_message callback
-    M->>W: send or broadcast through room SDK
-    W->>R: enqueue owned outbound payload by connection handle
-    R-->>C: encode authenticated server frame
-  end
-```
-
-## 5. 公网 wire protocol v1
-
-### 5.1 分帧
-
-TCP 流上的每帧以一个四字节 big-endian `frame_len` 开始。`frame_len` 不包含自身，v1
-继续沿用 corestack 当前不超过约 64 KiB 的上限：
-
-```text
-u32-be frame_len
-64-byte DgWireHeaderV1
-payload[payload_len]
-HMAC-SHA256 tag[32]    # 认证完成后的帧必须存在
-```
-
-认证前只允许固定白名单中的 handshake/control kind，并且没有 HMAC tag。connection 一旦
-进入 authenticated 状态，任何无 tag 帧、handshake kind 或错误 session id 都是协议错误。
-
-`frame_len` 必须精确等于 `header_len + payload_len + tag_len`。在分配 payload 内存前先检查：
-
-- `frame_len`、`header_len`、`payload_len` 的上下界和加法溢出；
-- v1 的 `header_len == 64`；
-- 当前连接状态是否允许该 kind/flag/tag；
-- 单连接当前已分配入站字节和帧数是否超过预算。
-
-### 5.2 固定头
-
-所有整数都使用 big-endian。v1 头恰好 64 字节：
-
-| Offset | 类型 | 字段 | 说明 |
-| ---: | --- | --- | --- |
-| 0 | `byte[4]` | magic | ASCII `DG01` |
-| 4 | `u16` | version | wire major version，v1 为 1 |
-| 6 | `u16` | header_len | v1 为 64，给未来扩展留边界 |
-| 8 | `u16` | kind | handshake/control/game/event/error/heartbeat |
-| 10 | `u16` | flags | authenticated、response 等标志 |
-| 12 | `u32` | protocol_id | 0 表示 gateway control；非零由游戏协议注册 |
-| 16 | `u32` | payload_len | 不含 header 和 tag |
-| 20 | `u32` | reserved | v1 必须为 0 |
-| 24 | `u64` | session_id_hi | 认证前为 0 |
-| 32 | `u64` | session_id_lo | 认证前为 0 |
-| 40 | `u64` | sequence | 每个方向从 1 严格递增 |
-| 48 | `u64` | request_id | 请求响应关联；0 表示无关联 server event |
-| 56 | `u64` | route_id | room id；gateway/auth/lobby 控制消息为 0 |
-
-实现必须逐字段 encode/decode，不能把本机 C struct 直接 `send` 或 `memcpy` 到 wire；否则会把
-padding、alignment 和 host endian 变成协议的一部分。
-
-HMAC 输入是线上的原始：
-
-```text
-u32-be frame_len || header bytes || payload bytes
-```
-
-不要先 decode protobuf 再重新 serialize 后验签；protobuf 字段顺序和 unknown fields 不应
-进入验签正确性的假设。tag 使用常量时间比较。
-
-每个 session secret 通过 HKDF 至少派生两个方向不同的 key：
-
-```text
-K_c2s = HKDF(session_secret, "draw-and-guess/c2s/v1")
-K_s2c = HKDF(session_secret, "draw-and-guess/s2c/v1")
-```
-
-同一个 key 不得跨 session 或双向复用。TCP 中 sequence 应严格等于上一个值加一；断线恢复
-创建新 session id/key 并重新从 1 开始，不尝试延续旧 connection 的 sequence。
-
-### 5.3 kind 与路由约束
-
-建议至少区分：
-
-| kind | payload | route_id | 网关行为 |
-| --- | --- | ---: | --- |
-| `CLIENT_HELLO` / `SERVER_HELLO` | control protobuf | 0 | 版本与能力协商，只能认证前使用 |
-| `AUTH_REQUEST` / `AUTH_RESULT` | control protobuf | 0 | 交给 auth provider |
-| `CONTROL_REQUEST` / `CONTROL_RESPONSE` | control protobuf | 0 | lobby、create/join/leave/resume |
-| `GAME_COMMAND` | opaque game bytes | room id | 先查 membership，再投递 room |
-| `GAME_EVENT` | opaque game bytes | room id | 仅服务端发出 |
-| `ERROR` | control protobuf | 对应上下文 | 可恢复的语义错误；协议损坏通常直接关闭 |
-| `HEARTBEAT` | 空或 control protobuf | 0 | 活性和 RTT，不更新游戏状态 |
-
-客户端 payload 中即使存在 uid 字段也不能成为授权依据。网关投递给 room 的内部消息会附加
-可信 `DgPrincipal` 和 membership；游戏 SDK 不向 room 暴露未经验证的 identity header。
-
-## 6. 认证、session 与重连
-
-推荐的 MVP 握手：
-
-1. TLS 建立后，client 发送支持的 wire/control/game protocol 版本和随机 nonce；
-2. server 选择共同版本并返回 server nonce；
-3. client 提交短期签名 access token；auth provider 验签并产生 principal；
-4. server 生成全新的 128-bit session id 和至少 256-bit 随机 session secret，在 TLS 内返回；
-5. 双方派生方向 key，从 sequence 1 开始发送 authenticated frame；
-6. server 另发一个短期、服务端签名且可撤销的 resume token。
-
-这里仍有一个产品选择：access token 可以只是 bearer token，也可以绑定客户端长期公钥，要求
-客户端对握手 transcript 签名。后者能降低 token 被复制后的冒用风险，但需要账号密钥注册、
-安全存储和丢失恢复流程。
-
-```mermaid
-sequenceDiagram
-  participant C as Client SDK
-  participant E as nginx TLS edge
-  participant G as Gateway
-  participant A as Auth provider
-  participant D as Room directory
-  participant R as Room actor
-
-  C->>E: establish TLS
-  E->>G: open one-to-one proxied TCP stream
-  Note over C,G: following arrows are logical protocol messages over that stream
-  C->>G: CLIENT_HELLO versions + client nonce
-  G-->>C: SERVER_HELLO selected versions + server nonce
-  C->>G: AUTH_REQUEST token and optional proof
-  G->>A: verify token or public-key proof
-  A-->>G: trusted principal or rejection
-  alt authentication succeeds
-    G-->>C: AUTH_RESULT session id + secret + resume token
-    C->>G: authenticated CONTROL_REQUEST join room
-    G->>D: authorize and create membership
-    D->>R: on_join trusted principal
-    R-->>C: GAME_EVENT room snapshot and current event sequence
-  else authentication fails
-    G-->>C: AUTH_RESULT rejected
-    G->>G: close after bounded retry policy
-  end
-```
-
-断线恢复不复用旧 session key：
-
-- client 重新建立 TLS，提交 resume token 和每个 room 的 `last_event_seq`；
-- auth 成功后得到新 session id/key 和新的 connection handle；
-- directory 把 membership 重新绑定到新 session；
-- room 若仍保留连续事件窗口，就从 `last_event_seq + 1` 重放；否则发送完整 snapshot；
-- 旧 connection handle 的 generation 失效，迟到的 outbound message 会被 reactor 丢弃；
-- 超过 grace period 后，room 才将暂时断线转成最终 leave。
-
-## 7. protobuf 的边界和构建链
-
-推荐 fixed binary envelope + protobuf payload，而不是把整个 envelope 放入 protobuf：
-
-- reactor/gateway 无需分配和复杂解析即可完成大小、版本、session、sequence 和路由检查；
-- game payload 仍可独立演进，网关保持 opaque；
-- HMAC 直接覆盖原始 wire bytes，不依赖 deterministic protobuf serialization；
-- Wireshark/日志工具仍可按 `protocol_id` 选择对应 descriptor 解码 payload。
-
-建议采用 protobuf-c，并把生成的 `.pb-c.c/.pb-c.h` 提交到仓库：
-
-| 构建场景 | 依赖 |
-| --- | --- |
-| 普通 CMake build | protobuf-c runtime；不要求本机安装 generator |
-| 修改 `.proto` 后再生成 | 固定版本的 `protoc` + `protoc-gen-c` |
-| CI 协议一致性检查 | 重新生成到临时目录并比较 tracked generated files |
-
-这样普通使用者不会因为缺少 `protoc` 无法构建，但协议生成仍可重复。应固定 generator 版本，
-禁止手改 generated files，并在协议兼容测试里保留旧版本 fixture。
-
-control schema 与 game schema 必须分目录、分 `protocol_id`：
-
-```text
-proto/control/v1/*.proto
-proto/games/draw_guess/v1/*.proto
-generated/control/v1/*
-generated/games/draw_guess/v1/*
-```
-
-兼容规则：不重用 field number；删除字段时 reserve；新增字段只能是 optional/repeated 且旧端可
-忽略；破坏性语义变化分配新 protocol id/major version。
-
-## 8. 进程内消息与服务器 SDK
-
-公网 wire struct 不能直接作为进程内 SDK ABI。解码并验证后，gateway 构造类似下面的可信
-内部消息：
+建议宿主侧明确只有以下主要 thread entry：
 
 ```c
-typedef struct DgConnHandle {
-    uint32_t reactor_id;
-    uint32_t slot;
+void *gateway_thread_main(void *userdata);
+void *auth_thread_main(void *userdata);
+void *lobby_thread_main(void *userdata);
+void *server_room_thread_main(void *userdata);
+```
+
+进程 `main` 本身是 control owner：加载 TOML、创建/关闭上述线程、持有 module generation，并处理
+reload/shutdown。它不执行 fd I/O 或游戏逻辑，也不需要额外创建一个 room-manager worker thread。
+
+建议主对象和控制入口：
+
+```c
+typedef struct ServerHost {
+    ServerChannels channels;
+    GatewayServer gateway;
+    ServerRoomManager room_manager;
+    AuthHandler auth;
+    LobbyHandler lobby;
+    pthread_t gateway_thread;
+    pthread_t auth_thread;
+    pthread_t lobby_thread;
+    _Atomic bool stop_requested;
+} ServerHost;
+
+int server_host_init(ServerHost *host, const ServerConfig *config);
+int server_host_run_control_loop(ServerHost *host);
+void server_host_request_shutdown(ServerHost *host);
+void server_host_cleanup(ServerHost *host);
+```
+
+`server_room_thread_main` 是宿主 trampoline：它设置 thread-local 宿主信息，然后调用动态库的唯一
+入口：
+
+```c
+SERVER_ROOM_EXPORT int server_room_entry(ServerRoomContext *context);
+```
+
+线程职责：
+
+| 线程 | 独占状态 | 只通过什么跨线程通信 |
+| --- | --- | --- |
+| main/control | module handle/generation、room pthread 创建/join、reload/shutdown | 统一 room request queue + Gateway-to-main command queue |
+| Gateway | fd、epoll、frame I/O、所有 mapping、live room routing table | Auth/Lobby/room/control 的 bounded queues |
+| Auth | 随机 UID/handle 生成流程、Auth request 临时状态 | Auth inbox/result queue |
+| Lobby | 大厅协议和房间调度策略 | Lobby inbox/outbox + 统一 room request API |
+| Room | 单个 room 的全部游戏状态和循环 | 对应 room inbox/outbox |
+
+Gateway 是所有 mapping 的唯一写者。Auth、Lobby 和 Game room 都不能拿到 mapping 裸指针，也不能
+直接关闭 fd。
+
+main/control loop 的形状：
+
+```c
+int server_host_run_control_loop(ServerHost *host)
+{
+    while (!atomic_load(&host->stop_requested)) {
+        server_room_manager_wait(&host->room_manager);
+        server_room_manager_apply_gateway_commands(&host->room_manager);
+        server_room_manager_reap_finished(&host->room_manager);
+        server_room_manager_advance_reload(&host->room_manager);
+        server_host_apply_admin_requests(host);
+    }
+    return server_host_shutdown_ordered(host);
+}
+```
+
+`wait` 返回时不持有 queue mutex；`dlopen`、module entry 启动和 `pthread_join` 都发生在 queue lock
+之外，因此不会阻塞 Gateway 获取通信队列的 mutex。
+
+## 3. 固定 64 字节 wire header
+
+### 3.1 Frame layout
+
+TCP stream 使用四字节长度前缀：
+
+```text
+u32_be frame_length
+SdkWireHeaderV1 header     # exactly 64 bytes
+uint8_t payload[]          # exactly header.payload_length bytes
+```
+
+`frame_length` 不包含自身，并且必须精确等于 `64 + payload_length`。v1 没有 HMAC trailer。
+
+Networking 必须先收齐整个 frame，再交给 Gateway。Auth、Lobby 和 Game room 永远不会看到 TCP
+半包、粘包或指向 connection scratch buffer 的临时 slice。
+
+### 3.2 Header offsets
+
+| Offset | Size | Wire field | 说明 |
+| ---: | ---: | --- | --- |
+| 0 | 4 | `magic` | ASCII `DG01` |
+| 4 | 2 | `version` | v1 为 1 |
+| 6 | 2 | `flags` | request/response/internal 等位标志 |
+| 8 | 2 | `route` | Auth、Lobby、Game |
+| 10 | 2 | `kind` | route 内操作或 room lifecycle kind |
+| 12 | 4 | `payload_length` | payload 字节数 |
+| 16 | 8 | `uid` | login 前为 0；之后每包携带 |
+| 24 | 16 | `identity_handle` | 128-bit opaque random bytes |
+| 40 | 8 | `room_id` | Game route 使用；其他 route 为 0 |
+| 48 | 8 | `sequence` | 每个方向独立严格递增 |
+| 56 | 4 | `player_slot` | client 发包必须为 0；Gateway/room 内部使用 |
+| 60 | 4 | `code` | result、leave、complaint 等稳定 code |
+
+总长度：`4 + 2 + 2 + 2 + 2 + 4 + 8 + 16 + 8 + 8 + 4 + 4 = 64`。
+
+`identity_handle` 是 byte array，不做整数 endian 转换；其他多字节整数全部 big-endian。
+
+固定协议不代表直接发送 C struct。编译器 padding、alignment 和 host endian 不能成为 wire ABI。
+只提供下面这类固定 offset codec：
+
+```c
+int sdk_wire_header_decode(
+    const uint8_t wire[SDK_WIRE_HEADER_SIZE],
+    SdkWireHeader *out_header);
+
+void sdk_wire_header_encode(
+    uint8_t wire[SDK_WIRE_HEADER_SIZE],
+    const SdkWireHeader *header);
+
+int sdk_wire_frame_size(
+    const SdkWireHeader *header,
+    uint32_t *out_frame_length);
+```
+
+这里的 decode 只是 64 字节固定 offset load/validation，不是 protobuf/JSON/TLV parser。
+
+Auth/Lobby 的 v1 control payload 也使用少量固定 record，不引入 schema parser：
+
+- `AUTH_LOGIN/AUTH_LOGOUT/AUTH_RESUME`：demo 不需要 payload，身份字段都在 header；
+- `LOBBY_LIST`：request 无 payload，response 为 count + 固定大小 room-info records；
+- `LOBBY_CREATE`：固定一个 `u64_be room_template_id`；
+- `LOBBY_JOIN/LOBBY_LEAVE`：目标使用 header 的 `room_id`，request 无 payload；
+- 所有 result 使用 header `code`，需要的额外结果采用对应固定 record。
+
+每种 control kind 必须有唯一且精确的 payload 长度；长度不符直接拒绝。Game payload 不受这些
+规则约束，由 Game room 自己定义。
+
+### 3.3 Header enums
+
+建议 route：
+
+```c
+typedef enum SdkRoute {
+    SDK_ROUTE_AUTH = 1,
+    SDK_ROUTE_LOBBY = 2,
+    SDK_ROUTE_GAME = 3
+} SdkRoute;
+```
+
+建议公开 kind：
+
+```text
+AUTH_LOGIN
+AUTH_RESUME
+AUTH_LOGOUT
+AUTH_RESULT
+
+LOBBY_LIST
+LOBBY_CREATE
+LOBBY_JOIN
+LOBBY_LEAVE
+LOBBY_RESULT
+
+GAME_DATA
+GAME_RESULT
+```
+
+room lifecycle kind 也使用 header 的 `kind` 表达，但只能由 Gateway 合成，client 发送这些值应视为
+协议违规：
+
+```text
+ROOM_PLAYER_JOIN
+ROOM_CONNECTION_LOST
+ROOM_CONNECTION_RESUMED
+ROOM_PLAYER_REMOVED
+ROOM_STOP
+```
+
+业务逻辑可以忽略除 `ROOM_STOP` 外的 lifecycle kind。`ROOM_STOP` 同时由 context 的原子 stop flag
+保证，不能因为 inbox 已满或模块忽略某个 packet 而无法退出。
+
+## 4. 主要 Gateway 数据结构
+
+以下是实现规划，不要求字段名逐字不变。
+
+### 4.1 `GatewayServer`
+
+```c
+typedef struct GatewayServer {
+    int listen_fd;
+    int epoll_fd;
+    _Atomic bool stop_requested;
+
+    GatewayConnectionTable connections;
+    GatewayIdentityTable identities;
+    GatewayMembershipTable memberships;
+    GatewayRoomRoutingTable room_routes;
+    ServerChannels *channels;
+} GatewayServer;
+```
+
+除 `channels` 指向的显式跨线程 queues/eventfd 外，其余字段只由 `gateway_thread_main` 访问。
+其他线程不能通过 `ServerChannels` 反向取得 Gateway 内部表。
+
+```c
+typedef struct ServerChannels {
+    AuthChannel auth;
+    LobbyChannel lobby;
+    GatewayRoomRequestQueue room_requests;
+    GatewayToRoomManagerQueue room_manager_commands;
+    int gateway_wakeup_fd;
+    int control_wakeup_fd;
+} ServerChannels;
+```
+
+### 4.2 `GatewayConnection`
+
+```c
+typedef enum GatewayConnectionState {
+    GATEWAY_CONNECTION_PREAUTH,
+    GATEWAY_CONNECTION_AUTH_PENDING,
+    GATEWAY_CONNECTION_ACTIVE,
+    GATEWAY_CONNECTION_CLOSING
+} GatewayConnectionState;
+
+typedef struct GatewayConnection {
+    int fd;
     uint64_t generation;
-} DgConnHandle;
+    GatewayConnectionState state;
 
-typedef struct DgPrincipal {
+    FrameReader reader;
+    FrameWriter writer;
+    PacketQueue outbound;
+
+    uint64_t bound_uid;
+    int64_t last_activity_ns;
+} GatewayConnection;
+```
+
+一个 fd 只属于一个 `GatewayConnection` generation。任何异步结果要带 `{fd slot, generation}`；
+generation 不匹配时丢弃，避免 fd 被 OS 复用后误投递。
+
+### 4.3 `GatewayIdentity`
+
+```c
+typedef enum GatewayIdentityState {
+    GATEWAY_IDENTITY_ATTACHED,
+    GATEWAY_IDENTITY_DETACHED,
+    GATEWAY_IDENTITY_REVOKED
+} GatewayIdentityState;
+
+typedef struct GatewayIdentity {
     uint64_t uid;
-    uint64_t roles;
-} DgPrincipal;
+    uint8_t identity_handle[16];
+    GatewayIdentityState state;
+    GatewayConnectionRef connection;
+    uint64_t expected_client_sequence;
+    uint64_t next_server_sequence;
+    int64_t disconnect_deadline_ns;
+    GatewayMembershipList memberships;
+} GatewayIdentity;
+```
 
-typedef struct DgRoomMessage {
-    DgConnHandle connection;
-    DgPrincipal principal;
+`uid -> GatewayIdentity` 是新草稿中的 UID-key mapping；demo 中所谓 key 就是随机 identity handle。
+
+每个 authenticated packet 必须同时满足：
+
+```text
+connection.state == ACTIVE
+connection.bound_uid == packet.uid
+identity uid/handle == packet uid/handle
+identity.connection == current connection generation
+packet.sequence == expected client-to-server sequence
+```
+
+任意一项失败：撤销/关闭策略按协议违规处理，不把包交给上层。
+
+两个方向的第一个 authenticated sequence 都是 1，并要求精确等于 expected value。Gateway 在身份
+检查成功后、route 前递增 client expected sequence；server sequence 在 frame 成功进入 connection
+writer queue 时消耗。sequence 不允许 wrap，达到 `UINT64_MAX` 前必须重新 login/resume 轮换 handle。
+
+### 4.4 多房间 membership
+
+```c
+typedef struct GatewayMembership {
+    uint64_t uid;
     uint64_t room_id;
+    uint32_t player_slot;
+    GatewayMembershipState state;
+} GatewayMembership;
+```
+
+需要两个索引：
+
+```text
+uid -> list of { room_id, player_slot, state }
+(room_id, player_slot) -> uid
+```
+
+因此一个 UID 能加入多个 room，但在同一个 room 里只能有一个 slot。client 的 Game packet 必须携带
+目标 `room_id`；Gateway 从 UID 的 membership list 中查到对应 slot，并覆盖 client header 中必须
+为 0 的 `player_slot`。
+
+demo UI 可以只暴露一个 active room，但 server 数据结构不能把 membership 写成单值。
+
+### 4.5 Gateway routing view 与 `ServerRoomManager`
+
+Gateway 只保存发送/路由所需的轻量 view：
+
+```c
+typedef enum GatewayRoomState {
+    GATEWAY_ROOM_STARTING,
+    GATEWAY_ROOM_RUNNING,
+    GATEWAY_ROOM_DRAINING,
+    GATEWAY_ROOM_STOPPING,
+    GATEWAY_ROOM_FINISHED
+} GatewayRoomState;
+
+typedef struct GatewayRoomRoute {
+    uint64_t room_id;
+    uint64_t room_instance_generation;
+    GatewayRoomState state;
+    ServerPacketQueue *inbox;
+    ServerPacketQueue *outbox;
+} GatewayRoomRoute;
+```
+
+main/control owner 持有真实 pthread、context 和 `.so` generation：
+
+```c
+typedef struct ServerRoomInstance {
+    uint64_t room_id;
+    uint64_t module_generation_id;
+    GatewayRoomState state;
+    pthread_t thread;
+    ServerRoomContext context;
+    ServerPacketQueue inbox;
+    ServerPacketQueue outbox;
+} ServerRoomInstance;
+
+typedef struct GatewayModuleGeneration {
+    uint64_t generation_id;
+    char *canonical_path;
+    char *loaded_copy_path;
+    void *dl_handle;
+    ServerRoomEntryFn entry;
+    size_t active_room_count;
+    GatewayModuleReloadState reload_state;
+} GatewayModuleGeneration;
+
+typedef struct ServerRoomManager {
+    ServerRoomTemplateTable templates;
+    ServerRoomInstanceTable instances;
+    GatewayModuleGenerationTable generations;
+    ServerChannels *channels;
+} ServerRoomManager;
+```
+
+同一 generation 可以被多个 room thread 同时执行。Game module 不得用未同步 writable global 保存
+单个房间状态；每个 instance 的状态在自己的 entry 栈/堆中。
+
+Gateway route 中的 inbox/outbox 指针借用 `ServerRoomInstance` storage。其释放使用明确 handshake：
+
+1. main/control 请求 Gateway disable/remove route；
+2. Gateway 停止访问 queues、清理 memberships，并回复 route-removed ack；
+3. main/control 才设置 stop、join room、释放 queues/context；
+4. generation 没有其他实例后才可 `dlclose`。
+
+安装则反向进行：main/control 完成 allocation、启动 entry 并收到 `mark_ready`，然后请求 Gateway
+install route。Gateway ack 前 Lobby 不能把用户加入该 room。
+
+主要跨 owner 消息：
+
+```c
+typedef enum GatewayToRoomManagerKind {
+    GATEWAY_TO_ROOM_MANAGER_CREATE,
+    GATEWAY_TO_ROOM_MANAGER_ROUTE_REMOVED_ACK,
+    GATEWAY_TO_ROOM_MANAGER_SHUTDOWN_ACK
+} GatewayToRoomManagerKind;
+```
+
+命名可在实现时调整，但 queue/buffer lifetime handshake 不能省略。
+
+## 5. Gateway 主循环和重要函数
+
+### 5.1 主循环
+
+```c
+void *gateway_thread_main(void *userdata)
+{
+    GatewayServer *server = userdata;
+
+    while (!server->stop_requested) {
+        gateway_epoll_wait(server);
+        gateway_accept_ready(server);
+        gateway_read_ready_connections(server);
+        gateway_apply_auth_results(server);
+        gateway_apply_lobby_results(server);
+        gateway_apply_room_requests(server);
+        gateway_drain_room_outputs(server);
+        gateway_expire_disconnected_identities(server);
+        gateway_flush_ready_connections(server);
+    }
+
+    gateway_shutdown_all(server);
+    return NULL;
+}
+```
+
+真实实现可以把 readiness 放在一次 epoll event dispatch 中；这里强调操作所有权和大致顺序。
+
+### 5.2 重要 Gateway 函数
+
+```c
+int gateway_accept_connection(GatewayServer *server, int client_fd);
+int gateway_consume_connection_bytes(
+    GatewayServer *server,
+    GatewayConnection *connection);
+
+int gateway_validate_packet_identity(
+    GatewayServer *server,
+    GatewayConnection *connection,
+    const SdkWireHeader *header);
+
+int gateway_route_complete_packet(
+    GatewayServer *server,
+    GatewayConnection *connection,
+    ServerPacket *packet);
+
+int gateway_route_auth_packet(...);
+int gateway_route_lobby_packet(...);
+int gateway_route_game_packet(...);
+int gateway_apply_room_request(
+    GatewayServer *server,
+    GatewayRoomRequest *request);
+void gateway_apply_room_requests(GatewayServer *server);
+
+int gateway_send_to_uid(...);
+int gateway_broadcast_room(...);
+void gateway_kick_connection(...);
+void gateway_revoke_uid(...);
+void gateway_detach_identity(...);
+void gateway_expire_identity(...);
+```
+
+`gateway_route_complete_packet` 只接收 Networking 已经收齐且通过 frame bounds check 的 owned
+packet。它不调用 Game parser。
+
+### 5.3 入站 Game packet
+
+```mermaid
+sequenceDiagram
+  participant C as Client SDK
+  participant N as Networking state machine
+  participant G as Gateway
+  participant I as UID identity map
+  participant M as Membership map
+  participant Q as Room inbox
+  participant R as Game-room thread
+
+  C->>N: length + 64-byte header + opaque payload
+  N->>N: collect and bounds-check complete frame
+  N->>G: owned complete packet
+  G->>I: verify connection + UID + handle + sequence
+  alt identity binding invalid
+    G->>G: revoke as needed and kick connection
+  else identity valid
+    G->>M: find packet room in UID membership list
+    alt membership absent or client player_slot nonzero
+      G->>G: kick for invalid route
+    else membership valid
+      M-->>G: trusted player slot
+      G->>Q: DATA record with slot + unchanged payload
+      Q-->>R: wake room loop
+      R->>R: optionally parse game payload
+    end
+  end
+```
+
+### 5.4 重复 UID
+
+一个 UID 只允许一个 active connection：
+
+- 新 login 永远产生新 UID，因此正常情况下不会重复；
+- resume 只允许目标 identity 当前处于 `DETACHED`；
+- 如果一个 active identity 收到第二个 connection 的 resume/bind，Gateway 撤销 UID/handle，关闭
+  新旧两个 connection，并从所有 room 删除该 UID；
+- 不采用“新连接抢占旧连接”，避免无法判断哪一边是冒用者。
+
+这个策略可能被知道 bearer handle 的攻击者用于 DoS，因此 public deployment 仍必须使用 TLS。
+
+## 6. Auth thread
+
+### 6.1 v1 行为
+
+Auth 不查 DB，不验证账号字段：
+
+- `AUTH_LOGIN`：生成唯一非零随机 `uint64_t uid` 和 128-bit random identity handle；
+- `AUTH_RESUME`：验证 Gateway 转发的旧 UID/handle 仍处于 `DETACHED`，成功后轮换 handle；
+- `AUTH_LOGOUT`：请求 Gateway revoke UID；
+- login/resume result 由 Gateway 安装 mapping 后再发给 client。
+
+随机值必须来自 OS CSPRNG/OpenSSL `RAND_bytes`，不能使用 `rand()`。
+Gateway 安装 identity 时负责最终唯一性检查；极低概率的 UID/handle collision 只让新 login 重新
+生成，绝不能覆盖或 revoke 已存在的 identity。
+
+login/resume success 是新 handle 下的第一条 server-to-client packet，`sequence == 1`；安装完成后
+Gateway 的下一条 server sequence 为 2。client 在收到 success 后从 client-to-server sequence 1
+开始。resume 会轮换 handle，因此旧方向 sequence 不延续。
+
+意外断线时 identity/membership 可保留默认 60 秒。显式 logout 或 grace expiry 会使 UID 和 handle
+彻底失效；仅离开某个 Game room 不注销 UID，因为一个 UID 可以加入多个房间。
+
+### 6.2 Auth channel
+
+```c
+typedef struct AuthRequest {
     uint64_t request_id;
-    uint32_t protocol_id;
+    GatewayConnectionRef connection;
+    SdkWireHeader header;
+    OwnedBytes payload;
+} AuthRequest;
+
+typedef enum AuthResultKind {
+    AUTH_RESULT_LOGIN_CREATED,
+    AUTH_RESULT_RESUME_APPROVED,
+    AUTH_RESULT_LOGOUT_APPROVED,
+    AUTH_RESULT_REJECTED
+} AuthResultKind;
+
+typedef struct AuthResult {
+    uint64_t request_id;
+    GatewayConnectionRef connection;
+    AuthResultKind kind;
+    uint64_t uid;
+    uint8_t identity_handle[16];
+    uint32_t code;
+} AuthResult;
+```
+
+Gateway 是 map 唯一写者；Auth 只产生结果。
+
+```mermaid
+sequenceDiagram
+  participant C as Client SDK
+  participant G as Gateway
+  participant A as Auth thread
+  participant I as Identity map
+
+  C->>G: AUTH_LOGIN with zero UID/handle/sequence
+  G->>A: enqueue AuthRequest
+  A->>A: generate random UID and handle
+  A-->>G: LOGIN_CREATED result
+  G->>I: atomically install identity and bind connection
+  G-->>C: AUTH_RESULT with UID, handle and server sequence
+  C->>G: next packet with UID, handle and client sequence 1
+```
+
+## 7. 统一 `GatewayRoomRequest` 队列
+
+### 7.1 目的和边界
+
+UID-room、live route 和 template accepting 状态不再暴露为大量跨线程函数。Lobby 和 main/control
+只构造一种 request，放入同一条专用 MPSC queue；Gateway 单线程 pop 后顺序应用。
+
+Gateway 自己触发的 disconnect expiry、duplicate UID 和 protocol kick 不把请求重新 enqueue 给自己，
+而是直接调用同一个内部 `gateway_apply_room_request`，避免 self-queue 等待或无意义绕行。
+
+### 7.2 Request 结构
+
+```c
+typedef enum GatewayRoomRequestOrigin {
+    GATEWAY_ROOM_ORIGIN_LOBBY,
+    GATEWAY_ROOM_ORIGIN_MAIN_CONTROL
+} GatewayRoomRequestOrigin;
+
+typedef enum GatewayRoomRequestKind {
+    GATEWAY_ROOM_LIST_TEMPLATES,
+    GATEWAY_ROOM_LIST_LIVE,
+    GATEWAY_ROOM_CREATE,
+    GATEWAY_ROOM_JOIN_UID,
+    GATEWAY_ROOM_LEAVE_UID,
+    GATEWAY_ROOM_REMOVE_UID_ALL,
+    GATEWAY_ROOM_REMOVE_ALL_MEMBERS,
+    GATEWAY_ROOM_INSTALL_ROUTE,
+    GATEWAY_ROOM_REMOVE_ROUTE,
+    GATEWAY_ROOM_INSTANCE_START_FAILED,
+    GATEWAY_ROOM_SET_TEMPLATE_ACTIVE,
+    GATEWAY_ROOM_SET_TEMPLATE_DRAINING,
+    GATEWAY_ROOM_SET_TEMPLATE_DISABLED
+} GatewayRoomRequestKind;
+
+typedef struct GatewayRoomRequest {
+    GatewayRoomRequestOrigin origin;
+    GatewayRoomRequestKind kind;
+    uint64_t request_id;
+    uint64_t parent_request_id;
+
+    uint64_t uid;
+    uint64_t room_id;
+    uint64_t room_template_id;
+    uint64_t room_instance_generation;
+    uint32_t player_slot;
+    uint32_t flags;
+    uint32_t code;
+
+    OwnedBytes payload;
+} GatewayRoomRequest;
+```
+
+不适用的字段必须为 0。`payload` 只用于有界 room config 或固定 control result；submit 成功后 queue
+拥有它，失败时 caller 保持 ownership。
+
+### 7.3 一条 MPSC queue、一把锁
+
+```c
+typedef struct GatewayRoomInflightCredit {
+    GatewayRoomRequestOrigin origin;
+    uint64_t request_id;
+    bool occupied;
+} GatewayRoomInflightCredit;
+
+typedef struct GatewayRoomRequestQueue {
+    ServerOwnedQueue queue;
+
+    GatewayRoomInflightCredit *credits;
+    size_t credit_capacity;
+    size_t lobby_inflight;
+    size_t lobby_inflight_limit;
+    size_t main_inflight;
+    size_t main_inflight_limit;
+} GatewayRoomRequestQueue;
+```
+
+`queue.mutex` 同时保护 ring metadata、byte budget、两类 origin 的 in-flight count 和固定容量
+credit table；没有第二把 room-request lock。credit table 在 init 时按两类 limit 之和一次
+分配，submit/complete 不在锁内分配内存。Lobby 与 main/control 都是 producer，Gateway 是唯一
+consumer。
+
+```c
+int gateway_room_request_submit(
+    GatewayRoomRequestQueue *queue,
+    GatewayRoomRequest *request);
+
+int gateway_room_request_try_pop(
+    GatewayRoomRequestQueue *queue,
+    GatewayRoomRequest *out_request);
+
+void gateway_room_request_complete_after_result_pop(
+    GatewayRoomRequestQueue *queue,
+    GatewayRoomRequestOrigin origin,
+    uint64_t request_id);
+```
+
+submit 在同一临界区检查 queue capacity 和对应 origin credit，成功时递增 in-flight。Gateway pop
+request 后不立即归还 credit；只有 origin consumer 从 reply queue pop 最终 result 后，才在
+不持有 reply-queue mutex 时调用 `complete_after_result_pop`。一个两阶段 create 从 Lobby
+submit 开始，直到 Lobby pop 其最终 result，始终占一个 Lobby credit。每个成功 submit 必须
+恰好对应一次 complete。`request_id` 在同一 origin 的 in-flight 期间必须唯一，debug/test
+构建对 unknown 或 duplicate complete 直接断言。
+
+### 7.4 Result 路由和预留容量
+
+```c
+typedef struct GatewayRoomResult {
+    GatewayRoomRequestOrigin origin;
+    GatewayRoomRequestKind request_kind;
+    uint64_t request_id;
+    uint64_t uid;
+    uint64_t room_id;
+    uint32_t player_slot;
+    uint32_t code;
+    OwnedBytes payload;
+} GatewayRoomResult;
+```
+
+- Lobby origin result 进入 `channels.lobby.inbox`，Lobby 再生成 client-facing response 放入自己的
+  outbox；
+- main/control origin result 进入 `channels.room_manager_commands`；
+- request 不携带 reply queue pointer 或 callback，避免保存跨 owner/跨 reload 的失效地址；
+- 两个 reply queue 的预留 record 数不少于对应 in-flight limit，预留 bytes 不少于
+  `limit * max_result_record_bytes`；init 时对乘法和容量做 overflow check；
+- list API 使用显式 cursor/page，每个 request 只产生一个有上界的 result，不允许突破
+  预留 byte budget。
+
+因此 Gateway 不需要等待 reply queue `not_full`。只要 request 能成功取得 credit，其最终 result
+就有预留位置。credit 必须保留到 result 被 pop；若在 push 后立即归还，未消费的旧 result
+和新请求会同时占用预留区，破坏这个上界。若 reply queue 已 closed，说明对应 subsystem
+正在 shutdown，Gateway 丢弃 result、直接归还 credit 并继续关闭流程。
+
+Gateway push result 时不持有 room-request mutex：先应用请求，再单独 lock reply queue
+push/unlock。Lobby/main 后续 pop/unlock reply queue，再单独 lock room-request queue 归还 credit。
+全程不会同时持有两把锁。
+
+### 7.5 Lobby API
+
+Lobby 只持有 request API，不持有 connection、UID、membership 或 route table：
+
+```c
+typedef struct ServerLobbyApi {
+    int (*list_room_templates)(void *userdata, uint64_t request_id);
+    int (*list_live_rooms)(void *userdata, uint64_t request_id);
+    int (*create_room)(
+        void *userdata,
+        uint64_t request_id,
+        uint64_t uid,
+        uint64_t room_template_id,
+        const void *config,
+        size_t config_len);
+    int (*join_room)(
+        void *userdata,
+        uint64_t request_id,
+        uint64_t uid,
+        uint64_t room_id);
+    int (*leave_room)(
+        void *userdata,
+        uint64_t request_id,
+        uint64_t uid,
+        uint64_t room_id);
+} ServerLobbyApi;
+```
+
+API 只异步 submit 并返回 `QUEUED/FULL/CLOSED/INVALID`，不等待 Gateway result。Lobby 继续处理 inbox；
+收到相同 request id 的 internal result、将其 pop 出 queue 后归还 credit，再回复 client。
+
+### 7.6 主要请求流程
+
+- `JOIN_UID`：Gateway 检查 template/route 允许加入、UID 尚未在该 room，分配 slot，原子更新两个
+  membership indexes，再给 room 发 `PLAYER_JOIN`；
+- `LEAVE_UID`：只删除指定 room membership，不影响该 UID 的其他 room；
+- `REMOVE_UID_ALL`：用于 logout、resume timeout 和 duplicate UID，遍历并删除全部 memberships；
+- `REMOVE_ALL_MEMBERS`：用于 immediate reload，只影响目标 room/template，用户 connection 保留并
+  返回 Lobby；
+- `SET_TEMPLATE_DRAINING`：拒绝新建和加入，但现有成员/房间继续；
+- `SET_TEMPLATE_DISABLED`：immediate reload 或 shutdown 期间拒绝所有新操作；
+- `INSTALL_ROUTE/REMOVE_ROUTE`：main/control 与 Gateway 建立/拆除 queue pointer 借用关系。
+
+create 是两阶段异步事务：
+
+1. Lobby submit `CREATE`；
+2. Gateway 验证后记录 Gateway-owned pending create，并向 main/control 发 create command；
+3. main/control load/start room；ready 后 submit `INSTALL_ROUTE`，失败则 submit
+   `INSTANCE_START_FAILED`，两者携带原 Lobby `parent_request_id`；
+4. Gateway 安装 route，按策略把创建者加入 room，再向 Lobby reply；Lobby pop 该最终
+   result 后归还 in-flight credit。
+
+加入第二个 room 不会自动离开第一个 room。
+
+## 8. Game-room server SDK
+
+### 8.1 动态 ABI 边界
+
+`server_room_sdk.h` 声明所有跨 `.so` 类型，并且 module 只导出：
+
+```c
+#define SERVER_ROOM_ABI_VERSION 1u
+
+SERVER_ROOM_EXPORT int server_room_entry(ServerRoomContext *context);
+```
+
+entry 是整个 room 生命周期：初始化私有状态、标记 ready、自行循环、处理输入/周期、产生输出、
+最终清理并返回。没有独立 init/update/cleanup export。
+
+### 8.2 Room record
+
+room buffer 使用 host ABI record，而不是把公网 64-byte wire header 原样暴露给 room：
+
+```c
+typedef enum ServerRoomRecordKind {
+    SERVER_ROOM_RECORD_DATA,
+    SERVER_ROOM_RECORD_PLAYER_JOIN,
+    SERVER_ROOM_RECORD_CONNECTION_LOST,
+    SERVER_ROOM_RECORD_CONNECTION_RESUMED,
+    SERVER_ROOM_RECORD_PLAYER_REMOVED,
+    SERVER_ROOM_RECORD_STOP
+} ServerRoomRecordKind;
+
+typedef struct ServerRoomInput {
+    ServerRoomRecordKind kind;
+    uint32_t player_slot;
+    uint32_t code;
     const uint8_t *payload;
     size_t payload_len;
-} DgRoomMessage;
+} ServerRoomInput;
 ```
 
-这是接口形状示例，不是已经冻结的 ABI。传入 room 回调的 payload 在回调结束前 borrowed；
-需要留存时必须复制。room 通过 context API 输出，SDK 在返回前复制或接管 payload，不能保存
-room 栈地址。
+对 `DATA`：Gateway 只添加可信 `player_slot`，payload byte-for-byte 不变。其他 kind 是 Gateway
+合成的 lifecycle record；游戏是否处理由业务决定。
 
-建议的 game-room callback 集合：
+停止不依赖可忽略 record：
 
 ```c
-room_create(config, out_room)
-room_destroy(room)
-room_join(room, context, principal, join_info)
-room_leave(room, context, principal, reason)
-room_message(room, context, message)
-room_tick(room, context, monotonic_now)
+bool server_room_stop_requested(const ServerRoomContext *context);
 ```
 
-`context` 提供：
+宿主设置原子 stop flag 并唤醒 wait；entry 必须观察后清理返回。
+
+### 8.3 Room output
 
 ```c
-send_to(connection_or_principal, protocol_id, payload)
-broadcast(room_id, audience_filter, protocol_id, payload)
-disconnect(connection, reason)
-schedule_timer(room_id, timer_id, deadline)
-publish_lobby_summary(room_id, summary)
+typedef enum ServerRoomRecipientKind {
+    SERVER_ROOM_RECIPIENT_ONE,
+    SERVER_ROOM_RECIPIENT_ALL,
+    SERVER_ROOM_RECIPIENT_MANY
+} ServerRoomRecipientKind;
+
+typedef struct ServerRoomOutput {
+    ServerRoomRecipientKind recipients;
+    uint32_t player_slot;
+    const uint32_t *player_slots;
+    size_t player_slot_count;
+    const uint8_t *payload;
+    size_t payload_len;
+} ServerRoomOutput;
+```
+
+Gateway 用 `(room_id, player_slot) -> uid -> active connection` 反向路由。room 不知道 UID/fd/handle。
+
+### 8.4 `ServerRoomContext` 和 API
+
+```c
+typedef struct ServerRoomApi {
+    int (*wait)(void *userdata, int timeout_ms);
+    int (*read)(void *userdata, ServerRoomInput *out_input);
+    int (*write)(void *userdata, const ServerRoomOutput *output);
+    bool (*stop_requested)(void *userdata);
+    int (*complain)(
+        void *userdata,
+        uint32_t player_slot,
+        uint32_t reason,
+        uint32_t severity);
+    int (*mark_ready)(void *userdata);
+    int64_t (*monotonic_now_ns)(void *userdata);
+} ServerRoomApi;
+
+typedef struct ServerRoomContext {
+    uint32_t abi_version;
+    uint64_t room_id;
+    const uint8_t *config;
+    size_t config_len;
+    void *userdata;
+    ServerRoomApi api;
+} ServerRoomContext;
 ```
 
 契约：
 
-- 同一 room 的回调永不并发，并按 mailbox 顺序执行；
-- callback 不能阻塞等待网络、磁盘或另一个 room；
-- room 只接收已经认证并经过 membership 检查的消息，但仍负责游戏授权；
-- `send/broadcast` 可能因预算耗尽失败，room 必须能处理失败结果；
-- auth 和 lobby 可以复用 actor runtime，但使用独立的受限 service API，不伪装成普通游戏房间；
-- v1 静态注册 game module；动态加载与状态迁移以后单独设计。
+- `context`、API table 和 userdata 在 entry 返回前有效；
+- config 是 entry 生命周期内 immutable borrowed bytes；
+- `read` 返回的 payload 借用到下一次 `read`，需要留存必须复制；
+- `write` 在返回前复制 output payload/slot list，module 返回后可立即复用源内存；
+- `wait` 可带 timeout，room 用它自行实现 tick，不由宿主规定 update 频率；
+- `stop_requested` 读取宿主原子 stop flag；一旦为 true，entry 必须尽快结束；
+- `complain` 只提交请求，Gateway 决定忽略、限流、移出 room、revoke UID 或关闭 connection；
+- `mark_ready` 只能成功一次；超时未 ready 的 room 启动失败；
+- 所有 API 只可从该 room entry thread 调用。
 
-## 9. 客户端 SDK 与 draw_app 插件
+建议 room 主循环：
 
-建议拆成三层：
+```c
+SERVER_ROOM_EXPORT int server_room_entry(ServerRoomContext *context)
+{
+    RoomState room;
+    if (room_init(&room, context->config, context->config_len) != 0) {
+        return SERVER_ROOM_ERROR;
+    }
+    if (context->api.mark_ready(context->userdata) != 0) {
+        room_cleanup(&room);
+        return SERVER_ROOM_ERROR;
+    }
 
-| 库 | 职责 | 不知道什么 |
+    while (!server_room_stop_requested(context)) {
+        context->api.wait(context->userdata, room_next_timeout_ms(&room));
+
+        ServerRoomInput input;
+        while (context->api.read(context->userdata, &input) == SERVER_ROOM_OK) {
+            room_handle_input(&room, context, &input);
+        }
+        room_update_due_tasks(&room, context);
+    }
+
+    room_cleanup(&room);
+    return SERVER_ROOM_OK;
+}
+```
+
+### 8.5 Buffer 和锁
+
+每个 room 有两条 bounded queue：
+
+```text
+Gateway thread --inbox--> Room thread
+Gateway thread <--outbox-- Room thread
+```
+
+锁只保护 queue metadata、payload ownership 和 condition wakeup。禁止持有 queue lock 调用 room
+module、Gateway mapping 操作或另一条 queue。
+
+queue 同时限制 record count 和 payload bytes：
+
+- inbox 满：Gateway 对对应 connection 停读/限流，持续超限则踢出；
+- outbox 满：`write` 返回 `SERVER_ROOM_FULL`，room 可稍后重试；
+- lifecycle record 保留独立 record/byte 容量，至少能容纳该 room 最大成员数的一次
+  `PLAYER_REMOVED` burst；
+- stop 使用 atomic flag + wake，不依赖向满 inbox 写 `STOP`。
+
+## 9. 完整同步与锁规划
+
+### 9.1 通用 owned queue
+
+所有跨线程 request/result/inbox/outbox 都使用同一个 owned bounded queue 基础结构：
+
+```c
+typedef struct ServerOwnedQueue {
+    pthread_mutex_t mutex;
+    pthread_cond_t not_empty;
+    pthread_cond_t not_full;
+
+    ServerOwnedRecord *records;
+    size_t record_capacity;
+    size_t record_count;
+    size_t head;
+    size_t tail;
+
+    size_t byte_capacity;
+    size_t bytes_used;
+    size_t reserved_control_records;
+    size_t reserved_control_bytes;
+    bool closed;
+} ServerOwnedQueue;
+```
+
+建议只暴露以下同步操作，不让调用者直接操作 mutex/head/tail：
+
+```c
+int server_owned_queue_try_push(ServerOwnedQueue *queue, ServerOwnedRecord *record);
+int server_owned_queue_push_wait(
+    ServerOwnedQueue *queue,
+    ServerOwnedRecord *record,
+    const _Atomic bool *stop_requested);
+int server_owned_queue_try_pop(ServerOwnedQueue *queue, ServerOwnedRecord *out_record);
+int server_owned_queue_pop_wait(
+    ServerOwnedQueue *queue,
+    ServerOwnedRecord *out_record,
+    const _Atomic bool *stop_requested,
+    int timeout_ms);
+void server_owned_queue_close(ServerOwnedQueue *queue);
+void server_owned_queue_destroy(ServerOwnedQueue *queue);
+```
+
+queue slot 拥有其中的 payload。push 成功表示 ownership 移入 queue；pop 把 ownership 移给 consumer。
+不能在 queue slot 被 pop 后继续借用其地址。
+
+push 失败时 caller 仍拥有 record/payload；pop 失败时 `out_record` 保持未修改。所有 API 都必须把
+`CLOSED/FULL/EMPTY/STOPPED/TIMED_OUT` 分成不同 result，不能用一个模糊的 `-1`。
+
+成功 push 在解锁前 signal `not_empty`；成功 pop 在解锁前 signal `not_full`。wait 版本在
+`while (!closed && !stop && predicate_not_satisfied)` 中等待，返回后 mutex 已释放。
+
+Room SDK 的 `read` 为维持“借用到下一次 read”契约，把 pop 出的 owned record 移到该
+`ServerRoomInstance` 的 `current_input` storage；下一次 read 或 entry cleanup 才释放旧 payload。
+
+### 9.2 所有 mutex/condition variable
+
+| 同步对象 | 数量 | 保护内容 | producer | consumer/允许等待者 |
+| --- | ---: | --- | --- | --- |
+| `room.inbox.mutex` | 每 room 1 | Gateway -> room records、record/byte budget、closed | Gateway | room thread 在 `wait/read` 中等待 `not_empty` |
+| `room.outbox.mutex` | 每 room 1 | room -> Gateway data/complaint、budget、closed | room thread | Gateway 只 try-pop，不等待 |
+| `auth.requests.mutex` | 1 | AuthRequest queue | Gateway | Auth thread 可等待 `not_empty` |
+| `auth.results.mutex` | 1 | AuthResult queue | Auth thread | Gateway 只 try-pop，不等待 |
+| `lobby.inbox.mutex` | 1 | client Lobby packets 和 GatewayRoomResult | Gateway | Lobby thread 可等待 `not_empty` |
+| `lobby.outbox.mutex` | 1 | client-facing Lobby result packets | Lobby thread | Gateway 只 try-pop，不等待 |
+| `room_requests.queue.mutex` | 1 | Lobby/main -> Gateway 的全部 UID-room/route/template requests、budget、origin credits | Lobby 与 main/control | Gateway 只 try-pop，不等待 |
+| `room_manager.commands.mutex` | 1 | Gateway -> main/control requests/acks | Gateway | main/control 被 `control_wakeup_fd` 唤醒后只 try-pop |
+| `room.lifecycle_mutex` | 每 room 1 | ready、finished、entry return code | room trampoline/main | main/control 可等待 `lifecycle_changed` |
+
+每个 queue 都初始化 `not_empty/not_full`。Gateway 为唯一网络线程，绝不等待 `not_full`；它只做短
+临界区 try-push/try-pop，FULL 时执行 backpressure、拒绝或关闭策略。
+
+Auth/Lobby 可以在自己的普通 output queue 上等待 `not_full`，但 wait predicate 必须同时检查 queue
+`closed` 和全局 stop，确保 Gateway shutdown 后不会永远阻塞。`GatewayRoomRequest` submit 对 Lobby
+和 main/control 都不等待：FULL 时 caller 保留 request 并异步重试或向 client 返回 busy。Game room
+的 `write/complain` 也不等待 `not_full`，而是返回 `SERVER_ROOM_FULL` 给业务循环。
+除 lifecycle ready/finished 的 condition wait 外，main/control 等待多源控制事件时只阻塞在
+`control_wakeup_fd`，醒来后 try-pop command queue，不同时在 queue condition 上再等一次。
+
+`lobby.inbox` 和 `room_manager.commands` 的 control record/byte 预留区不能被普通消息
+占用。room-request origin credit 在 result 被 origin consumer pop 前不归还，因此每个已接纳
+request 始终有一份可用的 reply 预留容量。`room_manager.commands` 还要为最坏情况下
+由 Lobby `CREATE` 产生的 Gateway-to-main command 预留容量；上界可直接取
+`lobby_inflight_limit + main_inflight_limit` records，byte 上界分别乘对应最大 record 大小后
+相加。
+
+v1 不使用 rwlock、spinlock、semaphore、barrier 或 recursive mutex。本文表格列出的 queue mutex
+和 room lifecycle mutex 就是项目代码的完整锁集合；以后新增共享子系统必须同时更新本节和锁序。
+
+### 9.3 Room lifecycle mutex
+
+```c
+typedef struct ServerRoomLifecycle {
+    pthread_mutex_t mutex;
+    pthread_cond_t changed;
+    bool ready;
+    bool finished;
+    int entry_result;
+    _Atomic bool stop_requested;
+} ServerRoomLifecycle;
+```
+
+- `mark_ready`：room thread lock，检查尚未 ready/finished，设置 ready，broadcast，unlock；
+- entry 返回：trampoline lock，写 `finished/entry_result`，broadcast，unlock；
+- main/control 等待 ready/finished：在 `while (!predicate)` 中 `pthread_cond_wait/timedwait`；
+- 请求 stop：main/control atomic store `stop_requested = true`，再唤醒 room inbox waiter；
+- `ServerRoomInstance.state`、generation count 和 module handle 仍只由 main/control 修改，不由这个
+  mutex 保护。
+
+### 9.4 Atomic 和 `eventfd`
+
+不需要 mutex 的跨线程标志：
+
+| 对象 | 类型 | 写者/读者 |
 | --- | --- | --- |
-| `libdg_wire` | length/header codec、HMAC/HKDF、sequence、边界检查 | 房间和 UI |
-| `libdg_client` | 非阻塞连接、握手、session、重连、control request、事件队列 | `TuiCell` 和具体游戏消息 |
-| `libdg_draw_guess` | typed protobuf command/event、snapshot/replay helper | fd、TLS、epoll |
+| `ServerHost.stop_requested` | `_Atomic bool` | main/control 写，全部 host threads 读 |
+| `GatewayServer.stop_requested` | `_Atomic bool` | main/control 写，Gateway 读 |
+| `room.lifecycle.stop_requested` | `_Atomic bool` | main/control 写，对应 room 读 |
 
-底层客户端 API 应是 caller-driven/nonblocking：暴露 socket interest 或 `pump`，并通过有界事件
-队列返回结果。可以以后提供后台线程 adapter，但后台线程绝不能直接调用页面 `.so` 中的函数，
-否则 `dlclose` 时无法安全同步。
+atomic 只表达停止意图，不保护复合数据结构。mapping、registry 和 queue metadata 不能仅靠 atomic
+访问。
 
-网络连接应由 `App` 宿主持有，而不是 Canvas 页面持有。这样切页和热重载不会断开 session。
-联机功能需要把当前 page ABI 升到 v2，但仍保持四个导出符号：
+建议创建一个 `gateway_wakeup_fd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)` 并加入 Gateway epoll。
+Auth、Lobby outbox、room outbox 和 room-request producers 在成功 enqueue 给 Gateway 后写 eventfd；Gateway 被唤醒后
+先 drain eventfd，再把所有 inbound-to-Gateway queues drain 到 empty。eventfd 只负责通知，不承载
+消息和 ownership。
 
-- 新增 `DRAW_PLUGIN_WRITE_BUS`：宿主在主线程把 borrowed、typed bus event 写入页面；
-- 新增 `DRAW_PLUGIN_READ_BUS`：宿主提供有容量的输出 buffer，页面复制一条待发 command；
-- 宿主每帧先 pump SDK、分发 inbound bus，再处理 UI input/tick，最后 drain outbound bus；
-- payload 不直接交换 `CanvasDocument`、链表指针或 native `TuiCell` 内存布局；
-- reload 时宿主暂停该 slot 的 bus 投递，装入新实例后请求 room snapshot，再恢复事件流。
+main/control 另有一个 `control_wakeup_fd`：Gateway 提交 room-manager command、room trampoline 标记
+finished、admin signal 到达时写入；control loop drain 后检查所有 command/lifecycle/admin predicates。
+这两个 eventfd 的方向固定，不能混用。
 
-使用 host-provided mutable buffer 的 `READ_BUS`，可以避免跨 `.so` 传递 allocator ownership 或
-保存指向即将卸载模块的 release function。具体 bus struct 与队列上限应在 ABI v2 设计时冻结。
+多个通知允许合并；Gateway 不能假设 eventfd counter 等于消息数。producer 遇到 `EAGAIN` 时已有
+wakeup pending，可保留队列数据让 Gateway drain；其他 eventfd 错误进入 server shutdown。
+
+Gateway 向 Auth/Lobby/room push 后使用对应 queue condition 唤醒 consumer。room stop 的唤醒顺序：
+
+1. atomic store stop；
+2. lock `room.inbox.mutex`；
+3. `pthread_cond_broadcast(room.inbox.not_empty)`；
+4. unlock；
+5. room 从 wait 醒来后重新检查 atomic stop predicate。
+
+OS signal handler 不调用 mutex、allocator、loader 或 room API；只设置 `sig_atomic_t` 并用
+async-signal-safe `write` 写 `control_wakeup_fd`，让 main/control loop 在正常上下文处理
+reload/shutdown。
+
+### 9.5 明确无锁的对象
+
+以下对象依靠单线程 ownership，不含 mutex：
+
+- Gateway connection table、identity table、membership indexes、live room routing table；
+- 每 connection 的 `FrameReader`、`FrameWriter` 和 network outbound queue；
+- Auth handler 的私有临时状态；
+- Lobby 的私有大厅状态；
+- main/control 的 TOML config、module generation table、room instance table；
+- 每个 Game room 的业务状态；
+- `ClientSdk` 的全部状态。
+
+`ClientSdk` 明确为非线程安全对象：同一个 instance 的 `service/get/send/login/...` 必须由同一个
+caller thread 串行调用。若应用要跨线程使用，在 SDK 外自行串行化，不能只给部分函数加锁。
+
+动态 module 如使用 process-global writable state，其同步完全由 module 自己负责；SDK 只保证同一
+room instance 的 entry 在一个线程运行，不保证同一 `.so` 的多个 room instance 互斥。
+
+### 9.6 全局锁序和临界区规则
+
+v1 使用一条最简单的锁序：**任何线程任意时刻最多持有一个 queue mutex 或 lifecycle mutex。**
+
+mutex 全部为 non-recursive。debug build 可使用 `PTHREAD_MUTEX_ERRORCHECK` 辅助发现重复加锁；正式
+构建可使用默认 mutex。所有 timed condition wait 使用 `CLOCK_MONOTONIC` condattr，不能受系统墙钟
+调整影响。stop atomic 使用 release store/acquire load。
+
+具体规则：
+
+1. payload allocation/copy 在获取 queue mutex 前完成；
+2. push 时只在锁内检查 closed/capacity、移动 owned record、更新 head/tail/count/bytes；
+3. pop 时只在锁内把 ownership 移到局部/current storage 并更新计数；
+4. 解锁后才做 Gateway map lookup、encode、fd I/O、日志、module callback 或另一 queue push；
+5. 不持有 queue mutex 调用 `server_room_entry`、Room API 的业务处理、Auth/Lobby handler；
+6. 不同时持有 inbox 和 outbox mutex；转发必须 pop、unlock，再 push；
+7. 不同时持有 lifecycle mutex 和任意 queue mutex；
+8. 所有 `pthread_cond_wait` 都放在 predicate `while` 中以处理 spurious wakeup；
+9. 不使用 `pthread_cancel`，所有线程通过 closed/stop predicate 协作退出。
+
+### 9.7 Close、销毁与内存顺序
+
+关闭一个 queue：lock，设置 `closed = true`，broadcast `not_empty/not_full`，unlock。closed 后 push
+失败；consumer 仍可 drain 已存在 records。queue 只能在以下条件全部满足后 destroy：
+
+- producer 不再可能访问；
+- consumer thread 已退出或 Gateway 已 ack route removal；
+- queue 中剩余 owned records 已逐项释放；
+- 没有线程仍在 condition wait。
+
+销毁顺序固定为：release records -> destroy cond vars -> destroy mutex -> free storage。TSan 测试必须
+覆盖正常 shutdown、immediate reload、drain reload、room 启动失败和满队列 stop。
+
+### 9.8 死锁审计
+
+按本文契约实现时，宿主的锁等待图不存在环，因此没有已知的 mutex/condition-variable
+死锁路径：
+
+| 可能的等待边 | 为何不成环 |
+| --- | --- |
+| Auth/Lobby/room 等待 inbox `not_empty` | 等待时 `pthread_cond_wait` 释放该 queue mutex，且 predicate 包含 `closed/stop` |
+| Auth/Lobby 等待普通 outbox `not_full` | Gateway 从不等待任何 queue 容量，可继续 drain 它 |
+| Gateway 生成 room result 或 create command | credit + 专用预留容量使 push 非阻塞，Gateway 不等 `not_full` |
+| main/control 等待 room ready/finished | lifecycle wait 释放 lifecycle mutex，room 不需要该锁才能读 stop/inbox |
+| main/control 等待 route-removed ack | Gateway 不需要 main 持有的锁来处理 request；main 等待前不持锁 |
+| room stop 遇到已满 inbox | stop 是 atomic flag + condition wake，不需要向队列再 push 一条 STOP |
+
+这个结论依赖三个不可放宽的条件：任意时刻最多持有一把项目 mutex；Gateway 不做
+容量等待；每个成功 submit 的 request 恰好完成一次 credit 归还。实现若在持锁时
+push 另一 queue、调 module/callback，或让 Gateway 阻塞等待 reply capacity，都会重新引入
+死锁可能。
+
+仍有几类“等待不结束”不是锁环，但要在运维上明确：
+
+- drain reload 没有 deadline；只要一个旧 room 不自然退出，reload 就会按设计一直
+  保持 `DRAINING`。管理员可另行发起 immediate reload，但宿主不自动升级；
+- 不合作的 room module 可以忽略 stop、在自己代码里永久阻塞，使 immediate reload 或
+  shutdown 卡在 `pthread_join`。v1 不用 `pthread_cancel`，也不得在该线程运行时
+  `dlclose`；应报告 stuck generation 并保留其 module handle。要强制杀死只能升级为
+  process isolation；
+- queue saturation 会形成 backpressure/busy，错误的 credit 泄漏会造成请求饥饿，但在
+  Gateway 不等待且 control reserve 不被侵占的契约下不形成互斥锁死锁；
+- 动态 module 自己创建的锁不在宿主保证范围内。module 不得在宿主 ABI 调用跨越
+  外持有会与 cleanup/stop 交叉等待的私有锁；
+- `.so` constructor/destructor 和 `dlopen/dlclose` 都在项目锁之外运行，不会构成宿主锁环，
+  但 module 仍可在 constructor/destructor 里卡住 loader。v1 module 不应定义有副作用的
+  constructor/destructor，也不得从其中重入宿主 API。
+
+## 10. 断线和 resume
+
+```mermaid
+stateDiagram-v2
+  [*] --> PreAuth
+  PreAuth --> Active : login allocates UID and handle
+  Active --> Detached : unexpected socket loss
+  Detached --> Active : resume before 60-second deadline
+  Detached --> Revoked : deadline expires
+  Active --> Revoked : explicit logout
+  Active --> Revoked : duplicate active binding
+  Revoked --> [*]
+```
+
+流程：
+
+1. socket 丢失后立即关闭 fd，并使旧 connection generation 失效；
+2. identity 进入 `DETACHED`，保留 UID、handle、双向 sequence 和全部 memberships；
+3. 向每个 membership 对应 room 发送 `CONNECTION_LOST`；
+4. client 在期限内用 UID、旧 handle 和正确 client sequence 发 `AUTH_RESUME`；
+5. Auth 同意后生成新 handle，Gateway 绑定新 connection、重置双向 sequence，并向所有 room 发
+   `CONNECTION_RESUMED`；
+6. 超过 60 秒则 revoke UID、删除全部 memberships，并向每个 room 发 `PLAYER_REMOVED`。
+
+如果同一 UID 仍为 `ATTACHED` 时收到 resume，新旧 connection 全部关闭并 revoke，不能走上述恢复。
+
+## 11. Module loading 和两种 reload
+
+### 11.1 TOML 配置
+
+```toml
+[gateway]
+listen = "127.0.0.1:4100"
+disconnect_grace_seconds = 60
+max_frame_bytes = 65536
+
+[auth]
+mode = "random_uid_demo"
+
+[[room_template]]
+id = 1
+name = "example"
+module = "./plugins/example_room.so"
+config = "./config/example_room.toml"
+inbox_records = 1024
+inbox_bytes = 1048576
+outbox_records = 1024
+outbox_bytes = 1048576
+```
+
+Lobby 只能从注册的 template 新建 room，不能让 client 提交任意 `.so` 路径。
+
+### 11.2 Loader 函数
+
+```c
+int server_module_load_candidate(...);
+int server_module_activate_generation(...);
+int server_room_start(...);
+int server_room_request_stop(...);
+int server_room_join(...);
+int server_module_reload_immediate(...);
+int server_module_reload_drain(...);
+void server_module_unload_generation(...);
+```
+
+加载沿用 generation copy：复制 canonical `.so` 到唯一临时文件，`dlopen(RTLD_NOW | RTLD_LOCAL)`，
+只解析 `server_room_entry`。一个 generation 的 `active_room_count` 归零且全部 thread 已 join 后才能
+`dlclose`。
+
+### 11.3 Immediate reload
 
 ```mermaid
 sequenceDiagram
-  participant Net as libdg_client
-  participant Host as draw_app host
-  participant Page as draw-and-guess page plugin
-  participant UI as TUI
+  participant A as Admin/host
+  participant G as Gateway
+  participant L as Loader
+  participant R as Affected room threads
 
-  Host->>Net: nonblocking pump
-  loop each queued network event
-    Net-->>Host: decoded SDK event with opaque game payload
-    Host->>Page: write BUS with borrowed event
+  A->>L: request immediate reload for template
+  L->>L: load candidate and resolve entry
+  alt candidate load fails
+    L-->>A: keep old generation and rooms unchanged
+  else candidate load succeeds
+    A->>G: disable new rooms and remove affected routes
+    G->>G: remove all affected memberships
+    G->>R: enqueue lifecycle removal while queues are live
+    G-->>A: routes removed and queues no longer borrowed
+    A->>R: set atomic stop and wake every room
+    R-->>A: entry cleanup and return
+    A->>A: join all old room threads
+    A->>L: activate candidate and dlclose old generation
+    A->>G: enable new rooms for template
   end
-  UI-->>Host: ordered TuiInputEvent values
-  Host->>Page: write INPUT and TICK
-  loop while plugin has outbound commands
-    Host->>Page: read BUS into host buffer
-    Page-->>Host: one copied command
-    Host->>Net: send command and copy into SDK queue
-  end
-  Host->>Page: read FRAME into host surface
 ```
 
-## 10. Draw-and-guess 游戏协议
+立即重载的确定语义是：只删除目标 template 所有受影响 room 的 memberships，把这些 UID
+退回 Lobby，保留 connection、identity 以及它们在其他 template/room 中的 memberships。不因
+一次 module reload 关闭整个 client connection。
 
-### 10.1 服务端权威状态
+旧 room state 不保存、不恢复。
 
-每个 room 至少维护：
+### 11.4 Drain reload
 
-- `room_epoch`：房间重建后变化，避免把旧事件接到新房间；
-- `event_seq`：所有权威 game event 的单调序号，用于重连重放；
-- participants、连接状态、角色、分数；
-- phase：waiting、countdown、drawing、round-result、game-result；
-- 当前 drawer、仅对 drawer 可见的 secret word；
-- 权威 canvas operation 列表与 `canvas_revision`；
-- 最近一段 event ring，用于短时断线重放；
-- 每个 principal 最近处理的 command id，用于幂等去重。
+1. candidate 先 load/resolve；失败则保持原状；
+2. template 标记 `DRAINING`，Lobby 的 create 请求返回 temporarily unavailable；
+3. 已存在的 room 继续运行，不插入 stop；仍允许其已有成员收发数据；
+4. 禁止新成员加入所有旧-generation room；
+5. room 游戏自然结束并让 `server_room_entry` 返回；main/control 请求 Gateway remove route；
+6. Gateway 清理 memberships 并 ack 后，main/control join、释放 buffers 并递减 generation count；
+7. 最后一个旧 room 退出后 activate candidate、`dlclose` old、template 回到 active；
+8. drain 没有 deadline，会无限期等待自然退出；只有 admin 另行发起 immediate reload 才改变
+   模式，宿主不自动升级。
 
-客户端发送 command，服务端校验并产生 event；客户端不能直接宣布“画布已变更”“猜对了”或
-“分数增加”。
+没有 per-room 在线代码替换，也没有 snapshot/restore ABI。
 
-### 10.2 建议消息
+## 12. Client SDK 边界
 
-| 方向 | 消息 | 关键字段/行为 |
-| --- | --- | --- |
-| client -> room | `SetReady` | command id、ready flag |
-| client -> room | `SubmitStroke` | command id、base revision、cell、有限 point 列表 |
-| client -> room | `UndoStroke` | command id、期望 revision；只有当前 drawer 可用 |
-| client -> room | `SubmitGuess` | command id、受限 UTF-8 文本 |
-| server -> one | `DrawerSecret` | room/round epoch、secret；绝不广播 |
-| server -> room | `RoomSnapshot` | phase、participants、scores、canvas、当前 event seq |
-| server -> room | `StrokeApplied` | event seq、新 canvas revision、规范化 stroke |
-| server -> room | `CanvasReset` | 新 round/epoch 和 revision |
-| server -> room | `GuessObserved` | 脱敏结果；正确答案不提前泄露 |
-| server -> room | `RoundChanged` | phase、drawer、deadline、公开提示 |
-| server -> room | `ParticipantChanged` | join、temporary disconnect、resume、leave |
-| server -> room | `CommandRejected` | request/command id、稳定错误码、当前 revision |
+### 12.1 `ClientSdk` 数据
 
-坐标沿用 Canvas 现有的中心相对 world coordinate，避免携带终端 viewport 坐标。wire 中的 cell
-显式编码 UTF-8 bytes/长度、fg、bg、style，不直接 memcpy `TuiCell`，因为它是本机插件 ABI
-结构，包含 padding、enum/整数布局和 UI 语义。
+```c
+typedef enum ClientSdkState {
+    CLIENT_SDK_DISCONNECTED,
+    CLIENT_SDK_PREAUTH,
+    CLIENT_SDK_LOGIN_PENDING,
+    CLIENT_SDK_ACTIVE,
+    CLIENT_SDK_DETACHED,
+    CLIENT_SDK_CLOSING
+} ClientSdkState;
 
-联机 snapshot 也不直接序列化 `CanvasDocument` 链表。它应使用数组从最旧已接受 operation 到
-最新 operation 编码，或者发送压平后的最终 cell map。数组天然无 `prev/next` 环；decode 时仍要
-检查 operation 数、sample 数、坐标和累计分配上限。`canvas_revision` 保持在 `INT64_MAX` 以内，
-与现有 JSON/Canvas 约束一致。
-
-为了降低输入频率，页面把一次连续鼠标 stroke 按点数或约 20--30 Hz 批量发送；server 可以
-规范化插值并广播权威 `StrokeApplied`。不能无声丢弃已经接受的权威 stroke event，否则各客户端
-revision 会分叉。
-
-## 11. 背压、限制与失败语义
-
-所有队列都必须有明确的帧数和字节预算：
-
-| 位置 | 达到上限时的 v1 策略 |
-| --- | --- |
-| connection inbound | 暂停 `EPOLLIN`；持续超限或超时则断开 |
-| room mailbox | 对该 room 返回 busy/rate-limited；不能无限分配 |
-| connection outbound | 先停止读入该 client；慢消费者超时后断开 |
-| transient presence/typing | 可合并或丢弃，并记录 metric |
-| accepted authoritative game event | 不可静默丢弃；排队失败必须触发断开或 snapshot resync |
-
-还需要固定：最大 frame、每秒 frame/byte、每 stroke point 数、guess UTF-8 长度、每 room 人数、
-每 principal 并发 session 数、auth 失败次数、heartbeat 和 idle timeout。
-
-协议级错误，例如错误长度、MAC、sequence、reserved 位或不允许的 kind，默认不回显细节并关闭
-连接。业务级拒绝，例如不是 drawer、revision 冲突或房间已满，返回稳定 error code 并保持连接。
-
-## 12. 对现有 corestack 的复用判断
-
-可复用的基础：
-
-- `wire.h` 的四字节 big-endian primitive 和 frame 上限；
-- `network/reader.c`、`network/writer.c` 处理 nonblocking partial I/O 的状态机思路；
-- OpenSSL 依赖、随机数、HMAC 和常量时间比较能力；
-- 现有 TUI 主循环、页面 ABI 与 Canvas world-coordinate/history 设计。
-
-不建议直接同时叠加现有两套 I/O abstraction：
-
-- `server/client_io.c` 是最多五帧的 stack 状态机，主要服务旧握手/logger；
-- `network/reader.c` 与 `writer.c` 是较新的 queue 方向，但 ownership/error contract 还未完整；
-- 两套代码都没有覆盖新 envelope、session、背压、reactor mailbox 和 reconnect。
-
-实现前应选定并收敛为一套 `DgConnectionIo`。推荐以 queue 型 reader/writer 为基础重构，因为它更
-适合长期双向连接；旧 `ClientIo` 留给旧协议，待迁移完成后再移除。当前 queue 实现至少要补：
-
-- queued reader frame 在 shutdown/free 时逐项释放；
-- reader/writer frame budget 的初始化和每轮重置契约；
-- writer queue 的 owned-buffer 规则和 enqueue API；
-- socketpair 半包/EAGAIN/peer-close 测试；
-- frame/byte high-water mark，而不只是 frame count；
-- 去掉与新 connection state 重复的状态和隐式 ownership。
-
-## 13. 建议的代码边界
-
-通用 transport/actor 能力适合留在 corestack，具体游戏协议和 UI adapter 留在 draw_app：
-
-```text
-corestack/
-  include/dg/wire.h             # public frame codec types
-  include/dg/client.h           # game-agnostic client SDK
-  include/dg/room.h             # server game-room callback SDK
-  src/dg/wire/                  # bounds, codec, HMAC, sequence
-  src/dg/client/                # nonblocking client state machine
-  src/dg/server/                # reactor, gateway, directory, actor runtime
-
-draw_app/
-  proto/control/v1/
-  proto/games/draw_guess/v1/
-  generated/
-  games/draw_guess/             # authoritative room implementation
-  plugins/draw_guess/           # TUI page and Canvas adapter
-  server/                       # executable wiring/config only
+typedef struct ClientSdk {
+    int fd;
+    ClientSdkState state;
+    uint64_t uid;
+    uint8_t identity_handle[16];
+    uint64_t next_client_sequence;
+    uint64_t expected_server_sequence;
+    FrameReader reader;
+    FrameWriter writer;
+    PacketQueue received;
+    PacketQueue outbound;
+} ClientSdk;
 ```
 
-依赖方向保持单向：wire 不依赖 protobuf；client/gateway 组合 wire 与 generated control codec；
-game-room/page adapter 组合 SDK 与 generated game codec。`corestack` 不能 include draw_app 的
-Canvas 或 plugin header；draw_app 可以通过公开 SDK 组合它们。
+客户端 SDK 作为 `client_sdk.c/.h` 直接加入工程。它不创建 thread，不接管 `poll/epoll`，不调用
+游戏 callback，不解析 Game payload。
 
-## 14. 测试计划
+### 12.2 主要接口
 
-### 14.1 Wire/crypto
+```c
+int client_sdk_init(ClientSdk *client, const ClientSdkOptions *options);
+void client_sdk_cleanup(ClientSdk *client);
 
-- 每个整数边界和 golden byte fixture；
-- frame length/header/payload/tag 相互不一致；
-- HMAC 任意 bit 翻转、错误方向 key、错误 session、重复/跳号 sequence；
-- 所有加法/乘法溢出、最大 frame 和零长度；
-- fuzz frame decoder，保证失败不泄漏、不越界、不进入 protobuf/game decoder；
-- 旧 protocol fixture 在新增字段后仍能解码。
+int client_sdk_connect(ClientSdk *client, const char *host, uint16_t port);
+int client_sdk_fd(const ClientSdk *client);
+unsigned client_sdk_wanted_events(const ClientSdk *client);
+int client_sdk_service(ClientSdk *client, unsigned ready_events);
 
-### 14.2 I/O 与并发
+int client_sdk_login(ClientSdk *client, const void *details, size_t details_len);
+int client_sdk_resume(ClientSdk *client);
+int client_sdk_logout(ClientSdk *client);
 
-- `socketpair` 强制一字节读写、EINTR/EAGAIN、half-close；
-- 慢 reader/writer、满 inbound/outbound/mailbox 和正常恢复；
-- fd 复用时旧 generation 的消息不能投到新连接；
-- 多 reactor 到单 room 的消息仍由 room worker 串行；
-- shutdown 时每个 owned payload 恰好释放一次，ASan/LSan/TSan 分别运行。
+int client_sdk_lobby_list(ClientSdk *client);
+int client_sdk_lobby_create(ClientSdk *client, uint64_t room_template_id);
+int client_sdk_lobby_join(ClientSdk *client, uint64_t room_id);
+int client_sdk_lobby_leave(ClientSdk *client, uint64_t room_id);
 
-### 14.3 Game/SDK
+int client_sdk_send(
+    ClientSdk *client,
+    uint64_t room_id,
+    const void *payload,
+    size_t payload_len);
 
-- room 以纯消息序列做 deterministic test，不启动 socket；
-- 非 drawer 画图、旧 revision、重复 command、答案泄漏、重连重放窗口；
-- snapshot + 后续 event 得到与服务端完全一致的 canvas；
-- Canvas operation 按最旧到最新应用，超限/非法数据整体拒绝；
-- client SDK 与 fake server 的握手、join、disconnect/resume；
-- 页面热重载期间网络事件有界缓存，reload 后 snapshot resync，不回调已卸载 `.so`。
+int client_sdk_get(ClientSdk *client, ClientSdkEvent *out_event);
+void client_sdk_event_release(ClientSdk *client, ClientSdkEvent *event);
+```
 
-## 15. 分阶段实现规划
+契约：
 
-### Phase 0：冻结威胁模型与 ADR
+- 所有 I/O nonblocking；`service` 只推进已 ready 的 fd 状态；
+- `send` 成功前复制 payload 到 bounded SDK queue，调用者返回后可修改源数据；
+- `get` 只返回完整 event；Game event payload 与 server room output byte-for-byte 相同；
+- `event_release` 前 payload 有效，release 后不得访问；
+- login details v1 可以为空，接口保留 bytes 以便以后增加真实 Auth；
+- SDK 自动填写 UID、handle、room ID 和 client sequence，游戏逻辑不直接构造 64-byte header；
+- SDK 校验 server UID、handle 和 server sequence，不通过则关闭连接；
+- result code 区分 `OK/WOULD_BLOCK/FULL/DISCONNECTED/PROTOCOL_ERROR/INVALID`。
 
-- 确认 nginx 是可信边界还是需要端到端密钥协商；
-- 确认 bearer token 或 public-key proof-of-possession；
-- 确认 protobuf-c 和 generated-source 策略；
-- 固定 v1 header、上限、错误码、版本兼容与 reconnect grace period；
-- 为 wire、control、game protocol 分配稳定 id。
+### 12.3 Raw TCP 限制
 
-退出标准：协议文档和 golden fixture 可由独立 codec 实现，不再依赖自然语言猜测。
+v1 `client_sdk_connect` 直接创建 nonblocking TCP socket，不执行 TLS handshake。部署加入 TLS 时有两种
+兼容演进方式：
 
-### Phase 1：wire codec 与 connection I/O
+- 在 SDK 外提供已加密 tunnel；
+- 把内部 `recv/send` 抽象成 stream adapter，但保持公开 `get/send/service` 语义不变。
 
-- 实现独立 `libdg_wire`，不依赖 game/protobuf；
-- 收敛 corestack reader/writer，加入 owned queue 和字节背压；
-- socketpair、fuzz、ASan/UBSan 测试；
-- 建立单进程单 reactor echo harness。
+当前不为 TLS 增加 OpenSSL client dependency。
 
-退出标准：任意分片输入都只产生完整、验证过的 frame，非法输入不会进入上层。
+### 12.4 draw_app 集成
 
-### Phase 2：认证 session 与 gateway
+`draw_app` 的 `App` 宿主持有 `ClientSdk`，页面插件不直接拥有 fd。宿主把完整 `ClientSdkEvent`
+写入页面 bus，并从页面读出 `room_id + opaque payload` 后调用 `client_sdk_send`。这样页面热重载
+不会卸载 client SDK 的 connection/session state。
 
-- 实现 hello/version/auth 状态机、HKDF/HMAC/sequence；
-- 实现 connection handle generation、principal/session directory；
-- 加入 heartbeat、timeout、rate limit 和稳定 error code；
-- nginx TLS 环境下做端到端认证测试。
+该扩展仍使用现有四个动态入口，只需要未来增加 page ABI 的 BUS read/write kind。
 
-退出标准：uid 只来自 auth provider，伪造 uid/route/session/sequence 均无法通过。
+## 13. Server shutdown
 
-### Phase 3：room actor runtime 与 server SDK
+建议顺序：
 
-- fixed room worker pool、bounded mailbox、eventfd wakeup；
-- directory/membership、join/leave、lobby service；
-- 冻结 game-room callback/ownership contract；
-- 用无业务含义的 echo room 做并发、背压和关闭测试。
+1. Gateway 停止 accept，并让 Lobby 拒绝 create/join；
+2. main/control 请求 Gateway 删除全部 room routes/memberships，并等待 ack；
+3. 设置每个 room stop、唤醒、等待 entry 返回并 join；
+4. 关闭并 drain/destroy room queues，确认 generation count 为 0 后 `dlclose`；
+5. close Auth/Lobby inbox/outbox，broadcast waiters，停止并 join 两个线程；Lobby 和 main/control
+   不再 submit 后 close 统一 `room_requests` queue；
+6. Gateway drain 最后输入，丢弃已关闭 consumer 的 result 并归还 credit，然后释放
+   connection、identity、membership 和 live routing table；
+7. 设置 Gateway stop、写 wakeup eventfd、join Gateway；
+8. close/destroy `room_manager_commands` 和所有剩余 channels，关闭 eventfd/epoll/listen fd。
 
-退出标准：room 代码不知道 fd/epoll/HMAC，且同一 room callback 永不并发。
+不得在 room entry 仍执行时卸载 `.so`，也不得在 Gateway map 已释放后处理 Auth/Lobby result。
 
-### Phase 4：draw-and-guess 协议与权威 room
+## 14. 测试规划
 
-- 定义/生成 game protobuf；
-- 实现 phase、角色、secret、stroke、guess、score、event ring 和 snapshot；
-- 用纯消息 simulation 覆盖完整多轮游戏；
-- 加入命令幂等、revision 冲突和权限测试。
+### 14.1 Wire codec
 
-退出标准：无客户端 UI 时也能确定性运行游戏并验证状态/event 序列。
+- 64-byte golden fixture 和每个 offset 的 big-endian 值；
+- encode -> decode 完全相同；
+- magic/version/route/kind/flags/code 非法值；
+- `frame_length != 64 + payload_length`、整数溢出和最大 payload；
+- client 尝试设置非零 player slot 或发送 internal lifecycle kind；
+- fuzz fixed header/frame decoder，失败时不进入 Gateway route。
 
-### Phase 5：客户端 SDK 与 draw_app 接入
+### 14.2 Identity 和 membership
 
-- 实现 `libdg_client` 和 `libdg_draw_guess`；
-- `App` 持有连接并 pump SDK；
-- 设计并升级 page ABI v2 的 BUS write/read；
-- 增加联机页面或扩展 Canvas 页面，完成 stroke/snapshot 映射；
-- 验证切页、插件 reload、断线重连和 snapshot resync。
+- 每包 UID/handle/connection generation/sequence 任一不匹配立即踢出；
+- client/server 两个 sequence 相互独立；
+- 重复包、跳号包、resume 后旧 handle；
+- 同 UID 第二个 active connection 导致两边关闭和 UID revoke；
+- 一个 UID 同时加入多个 room，并在不同 room 得到不同 slot；
+- 离开一个 room 不影响其他 memberships；
+- disconnect/resume/60 秒 expiry 使用 fake monotonic clock。
 
-退出标准：热重载页面不关闭 session，客户端最终画布和服务端权威状态一致。
+### 14.3 `GatewayRoomRequest` 和锁
 
-### Phase 6：加固与容量验证
+- Lobby/main 并发 MPSC submit，Gateway 保持唯一 consumer；
+- record/byte capacity、每 origin in-flight credit 与 FULL/CLOSED ownership；
+- 每个成功 submit 恰好一次 complete，unknown/duplicate request id 报错，result pop 前不归还
+  credit；
+- Lobby/main reply 预留 slots/bytes 不被普通消息占用；
+- 两阶段 create 在 ready/failed 之前保留 Lobby credit；
+- 同时触发满队列、disconnect expiry、duplicate UID、immediate reload 和 shutdown；
+- TSan/instrumentation 断言任意线程不同时持有两把项目 mutex。
 
-- fuzz control/game decoder、故障注入、慢客户端和 queue saturation；
-- 指标：连接数、队列字节、room tick 延迟、drop/disconnect、auth/error code；
-- 根据目标房间数和消息率压测并调整 reactor/worker 分片；
-- 再决定持久化、跨进程扩展和 room migration 是否进入 v2。
+### 14.4 Room ABI/buffers
 
-## 16. 需要确认的问题
+- DATA payload 经过 Gateway 后 byte-for-byte 相同；
+- lifecycle kind 和 slot 正确，忽略 lifecycle 不影响 SDK 安全；
+- bounded inbox/outbox 的 record/byte limit；
+- STOP 在队列满时仍能唤醒和退出；
+- `read` borrowed lifetime、`write` copy lifetime；
+- complaint 不能引用其他 room 的 slot；
+- 同 generation 多 room thread、mark-ready timeout、异常 entry return。
+- 每个 queue push/pop/close 的 condition predicate、spurious wakeup 和 stop wake；
+- instrumentation 断言任何线程没有同时持有两把宿主 mutex；
+- Gateway 不等待 `not_full`，module callback 和 `dlopen/join` 均发生在所有 queue lock 之外。
 
-以下问题不阻塞先写 codec 测试，但会影响 Phase 0 的最终接口：
+### 14.5 Reload
 
-1. **TLS 信任边界**：nginx 是否完全可信，且 nginx 到 server 的明文内网连接可接受？如果不
-   接受，是选择 TLS passthrough、内网 mTLS，还是应用层 X25519？
-2. **用户身份形态**：MVP 用服务端签名的短期 bearer token 是否足够，还是一开始就要求每个
-   用户持有长期公私钥并做 proof-of-possession？
-3. **重连语义**：断线后保留玩家位置多久？建议默认 60 秒；期间 drawer 是否暂停回合计时？
-4. **并发模型**：一个用户是否允许多设备、同时加入多个房间或旁观多个房间？
-5. **规模目标**：单机预期同时连接、房间数、每房人数和 stroke 更新率是多少？这决定默认
-   reactor/worker/queue 上限。
-6. **持久化**：进行中的房间在服务器崩溃后可以消失，还是必须从 event log 恢复？
-7. **协议工具链**：是否接受 protobuf-c runtime submodule，并把 generated C 提交进仓库？
+- candidate load 失败不改变旧 room；
+- immediate 模式先删 memberships，再 stop/join，最后 `dlclose`；
+- immediate 只影响目标 template 的 rooms，UID 返回 Lobby 且其他 memberships 不变；
+- drain 模式拒绝新建和新加入，现有 room/成员继续运行；
+- 最后一个 room return 后才切换 generation；
+- fake room 不退出时始终保持 `DRAINING`，不由计时器自动升级；
+- drain 期间 shutdown、candidate 文件再次变化和 admin 显式改用 immediate；
+- 不合作 room 使 join 不返回时，外部 watchdog 可观测 stuck generation，且宿主不
+  `pthread_cancel`/不 `dlclose`。
 
-若暂时不指定，建议 MVP 默认值是：nginx 为可信边界、短期签名 bearer token、60 秒重连窗口、
-每 session 一个 active player room、临时房间不做崩溃恢复、protobuf-c generated C 入库。
+### 14.6 Client SDK
+
+- fake/raw socket 的一字节 partial I/O、EAGAIN、EINTR、peer close；
+- `send` copy、`get/release`、queue full；
+- login/random UID、resume/handle rotation、logout invalidation；
+- Game payload 透明往返；
+- SDK 不创建线程、不调用 game callback、不解析 payload。
+
+使用 ASan/UBSan/TSan；frame codec、Networking reader 和 control fixed-record decoder 建 fuzz target。
+
+## 15. 实施阶段
+
+### Phase 0：头文件和 wire fixture
+
+- 写 `sdk_wire.h`：固定 offset、enum、host header 和 encode/decode API；
+- 写 `server_room_sdk.h`：one-entry ABI、context、record、output 和 result codes；
+- 写 `client_sdk.h`：state、service/get/send/Auth/Lobby API；
+- 冻结 `ServerOwnedQueue`、`GatewayRoomRequest/Result`、origin credit、reply reserve、room
+  lifecycle、atomic/eventfd 和无嵌套锁规则；
+- 写 TOML example 和 64-byte golden fixture；
+- 只编译接口/codec tests，不启动 server。
+
+### Phase 1：单 Gateway thread
+
+- 整理 corestack 现有 reader/writer，保留一套 complete-frame state machine；
+- 实现 listen/accept/epoll、connection generation 和 outbound queue；
+- 实现 identity、双向 sequence、多 membership 索引；
+- 用静态 fake Auth/Lobby/room queue 验证路由。
+
+### Phase 2：Auth/Lobby threads
+
+- 实现 random UID/handle Auth 和 login/resume/logout；
+- 实现 Lobby 的异步 `GatewayRoomRequest` API、专用 MPSC queue 和有界 room registry page；
+- 实现多房间 join/leave 与 lifecycle records；
+- 实现断线 60 秒 grace 和重复 UID 全踢。
+
+### Phase 3：Room loader/SDK
+
+- 实现 bounded room buffers 和宿主 trampoline；
+- 实现 TOML room template、generation copy、`dlopen`、ready/stop/join；
+- 增加最小 `example_room.so` 作为 SDK 模板；
+- 实现 immediate/drain 两种 reload state machine。
+
+### Phase 4：Client SDK
+
+- 实现 raw nonblocking connect/service/get/send；
+- 实现固定 header、Auth/Lobby control 和 Game opaque route；
+- fake socket 与 server 集成测试；
+- 接入 draw_app 宿主 bus，不把 fd 放入页面插件。
+
+### Phase 5：端到端和加固
+
+- 用 echo game 验证 payload 透明、多房间和 complaint；
+- 测试 reload、shutdown、queue saturation 和恶意 header；
+- 完善日志、metrics 和 resource limits；
+- 部署前补 client-to-nginx TLS，并重新评估 bearer handle 的安全性。
+
+## 16. v1 已冻结的相关契约
+
+- Immediate reload 只把 UID 踢出受影响 room 并返回 Lobby，不关闭 connection，不影响
+  其他 room membership；
+- Drain 禁止新建和加入旧-generation room，无 deadline，不自动升级；
+- demo 身份契约是 128-bit random handle + 双向 sequence，无 timestamp/HMAC；
+- `AUTH_RESUME` 保留：意外断线后 60 秒内可恢复同 UID，成功时轮换 handle 并重置
+  sequence；超时或 logout 后 UID 失效；
+- 所有跨线程 UID-room/route/template 变更统一走 `GatewayRoomRequest` MPSC queue；
+- 宿主锁契约下无已知锁环；无期 drain 和不合作 module 是已知可持续等待风险，
+  但不是 mutex deadlock。
