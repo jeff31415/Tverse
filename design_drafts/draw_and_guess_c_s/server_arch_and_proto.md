@@ -1,6 +1,10 @@
 # Server/Client architecture and protocol
 
-状态：v1 设计草案。本文先冻结模块边界、线程入口、主要数据结构和 SDK 契约；实现尚未开始。
+状态：v1 设计基线。本文冻结模块边界、线程入口、主要数据结构和 SDK 契约。
+最小垂直实现已在 [`online/`](../../online/) 开始：包含 64-byte codec、owned queue/credit、
+单 Gateway `epoll` thread、Auth/Lobby/room threads、`dlopen` echo room、demo client 和
+loopback 集成测试。resume/logout、create/list/leave、多 live room、reload/drain 和最终
+nonblocking Client SDK 仍按本文后续阶段实现。
 
 设计输入：
 

@@ -1,7 +1,12 @@
 # Server/Client Architecture and Protocol
 
-Status: v1 design draft. This document freezes module boundaries, thread entry
-points, primary data structures, and SDK contracts before implementation.
+Status: v1 design baseline. This document freezes module boundaries, thread
+entry points, primary data structures, and SDK contracts. A minimal vertical
+slice now exists in [`online/`](../../online/): the 64-byte codec, owned
+queues/credits, one Gateway `epoll` thread, Auth/Lobby/room threads, a `dlopen`
+echo room, demo client, and loopback integration tests. Resume/logout,
+create/list/leave, multiple live rooms, reload/drain, and the final nonblocking
+Client SDK remain later phases of this design.
 
 Design inputs:
 
