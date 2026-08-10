@@ -109,6 +109,7 @@ add_subdirectory(plugins)
 
 set(DRAW_APP_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
 add_subdirectory(examples/minimal_page_plugin)
+add_subdirectory(online)
 
 add_executable(draw_app
     main.c

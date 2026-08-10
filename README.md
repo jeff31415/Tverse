@@ -43,3 +43,10 @@ See [`docs/README.md`](docs/README.md) for the architecture, controls and
 source guide. The current plugin contract is documented separately in
 [`docs/plugin-abi.md`](docs/plugin-abi.md), with lifecycle sequence diagrams in
 [`docs/application-lifecycle.md`](docs/application-lifecycle.md).
+
+The first server/client implementation slice lives in [`online/`](online/).
+It includes the fixed wire codec, bounded cross-thread queues, a one-thread
+Gateway, Auth/Lobby/room threads, a dynamically loaded echo-room demo, client
+executable, and loopback integration tests. Its accepted design is kept in
+[Chinese](design_drafts/draw_and_guess_c_s/server_arch_and_proto.md) and
+[English](design_drafts/draw_and_guess_c_s/server_arch_and_proto.en.md).
