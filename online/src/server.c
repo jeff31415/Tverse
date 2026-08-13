@@ -36,6 +36,11 @@
 #define DRAW_SERVER_LOBBY_CREDIT_LIMIT 16u
 #define DRAW_SERVER_MAIN_CREDIT_LIMIT 8u
 #define DRAW_SERVER_ROOM_READY_TIMEOUT_MS 3000
+/*
+ * Bounds automatic room restarts so a room that fails immediately cannot turn
+ * the Gateway tick into a spawn loop.
+ */
+#define DRAW_SERVER_MAX_ROOM_RESTARTS 5u
 
 typedef enum DrawServerConnectionState {
     DRAW_SERVER_CONNECTION_FREE = 0,
@@ -209,6 +214,11 @@ struct DrawOnlineServer {
     void *room_module_handle;
     DrawRoomEntryFn room_entry;
     DrawServerRoomRuntime room_runtime;
+    uint8_t *room_config;
+    size_t room_config_length;
+    /* Gateway-thread only; see draw_server_supervise_room. */
+    unsigned room_restart_count;
+    bool room_unavailable;
 
     DrawServerConnection connections[DRAW_SERVER_MAX_CONNECTIONS];
     DrawServerIdentity identities[DRAW_SERVER_MAX_IDENTITIES];
@@ -1191,6 +1201,14 @@ static void draw_server_apply_room_request(
         draw_server_publish_room_result(server, request, player_slot, code);
         return;
     }
+    if (server->room_unavailable) {
+        draw_server_publish_room_result(
+            server,
+            request,
+            player_slot,
+            DRAW_WIRE_CODE_INTERNAL);
+        return;
+    }
     connection = draw_server_find_connection(server, request->connection);
     identity = draw_server_identity_for_connection(server, connection);
     if (connection == NULL || identity == NULL || identity->uid != request->uid) {
@@ -1327,6 +1345,142 @@ static void draw_server_drain_room_outputs(DrawOnlineServer *server)
     }
 }
 
+static void *draw_server_room_thread_main(void *userdata);
+
+/*
+ * Evicts every member of the room and tells each one why. The room is already
+ * gone, so no PLAYER_REMOVED is enqueued: there is nobody to receive it.
+ */
+static void draw_server_evict_room_members(
+    DrawOnlineServer *server,
+    uint32_t code)
+{
+    size_t index;
+
+    for (index = 0u; index < DRAW_SERVER_MAX_MEMBERSHIPS; ++index) {
+        DrawServerMembership *membership = &server->memberships[index];
+        DrawServerIdentity *identity;
+        DrawServerConnection *connection;
+
+        if (!membership->used || membership->room_id != DRAW_SERVER_ROOM_ID) {
+            continue;
+        }
+        identity = draw_server_find_identity_by_uid(server, membership->uid);
+        connection = identity != NULL
+            ? draw_server_find_connection(server, identity->connection)
+            : NULL;
+        if (connection != NULL
+            && draw_server_send_authenticated(
+                   server,
+                   connection,
+                   DRAW_WIRE_ROUTE_GAME,
+                   DRAW_WIRE_GAME_RESULT,
+                   membership->room_id,
+                   membership->player_slot,
+                   code,
+                   NULL,
+                   0u)
+                != 0) {
+            draw_server_close_connection(server, connection);
+        }
+        memset(membership, 0, sizeof(*membership));
+    }
+}
+
+/*
+ * Discards whatever the dead room never consumed or never had delivered. The
+ * queues stay open, so this is a plain drain rather than a destroy.
+ */
+static void draw_server_discard_room_queues(DrawOnlineServer *server)
+{
+    DrawOwnedRecord record;
+
+    while (draw_owned_queue_try_pop(&server->room_inbox, &record)
+        == DRAW_QUEUE_OK) {
+        free(record.item);
+    }
+    while (draw_owned_queue_try_pop(&server->room_outbox, &record)
+        == DRAW_QUEUE_OK) {
+        free(record.item);
+    }
+}
+
+/*
+ * Detects a room entry that returned while the server is still running and
+ * brings the room back. Without this the room thread's exit is invisible:
+ * room_finished is otherwise only read during startup, so the inbox would fill
+ * silently and every client would see BUSY forever.
+ *
+ * Runs on the Gateway thread, before the queue drain, so a join applied later
+ * in the same iteration reaches the replacement room rather than the corpse.
+ */
+static void draw_server_supervise_room(DrawOnlineServer *server)
+{
+    int entry_result;
+
+    if (atomic_load_explicit(&server->stop_requested, memory_order_acquire)) {
+        return; /* Shutdown joins the room itself; do not race it. */
+    }
+    if (!server->room_lifecycle_ready || !server->room_thread_started) {
+        return;
+    }
+    if (pthread_mutex_lock(&server->room_lifecycle_mutex) != 0) {
+        return;
+    }
+    if (!server->room_finished) {
+        (void)pthread_mutex_unlock(&server->room_lifecycle_mutex);
+        return;
+    }
+    entry_result = server->room_entry_result;
+    (void)pthread_mutex_unlock(&server->room_lifecycle_mutex);
+
+    /* Join with no lock held: the room thread takes room_lifecycle_mutex on
+     * its way out, so holding it here would deadlock. */
+    (void)pthread_join(server->room_thread, NULL);
+    server->room_thread_started = false;
+
+    draw_server_evict_room_members(server, DRAW_WIRE_CODE_INTERNAL);
+    draw_server_discard_room_queues(server);
+
+    if (server->room_restart_count >= DRAW_SERVER_MAX_ROOM_RESTARTS) {
+        if (!server->room_unavailable) {
+            server->room_unavailable = true;
+            fprintf(stderr,
+                "draw_online_server: room entry returned %d and exceeded %u "
+                "restarts; room is now unavailable\n",
+                entry_result,
+                (unsigned)DRAW_SERVER_MAX_ROOM_RESTARTS);
+        }
+        return;
+    }
+    server->room_restart_count += 1u;
+    fprintf(stderr,
+        "draw_online_server: room entry returned %d; restarting (%u/%u)\n",
+        entry_result,
+        (unsigned)server->room_restart_count,
+        (unsigned)DRAW_SERVER_MAX_ROOM_RESTARTS);
+
+    if (pthread_mutex_lock(&server->room_lifecycle_mutex) == 0) {
+        server->room_ready = false;
+        server->room_finished = false;
+        server->room_entry_result = 0;
+        (void)pthread_mutex_unlock(&server->room_lifecycle_mutex);
+    }
+    if (pthread_create(
+            &server->room_thread,
+            NULL,
+            draw_server_room_thread_main,
+            &server->room_runtime)
+        != 0) {
+        server->room_unavailable = true;
+        fprintf(stderr,
+            "draw_online_server: room thread restart failed; room is now "
+            "unavailable\n");
+        return;
+    }
+    server->room_thread_started = true;
+}
+
 static void draw_server_drain_gateway_queues(DrawOnlineServer *server)
 {
     draw_server_drain_auth_results(server);
@@ -1397,6 +1551,7 @@ static void *draw_server_gateway_thread_main(void *userdata)
                 }
             }
         }
+        draw_server_supervise_room(server);
         draw_server_drain_gateway_queues(server);
     }
     draw_server_drain_gateway_queues(server);
@@ -1912,6 +2067,30 @@ static int draw_server_load_room(
     return server->room_entry == NULL ? -1 : 0;
 }
 
+static int draw_server_copy_room_config(
+    DrawOnlineServer *server,
+    const void *config,
+    size_t config_length)
+{
+    if (config == NULL || config_length == 0u) {
+        return 0;
+    }
+    if (config_length > SIZE_MAX - 1u) {
+        return -1;
+    }
+    /*
+     * One extra NUL so a room may read text configuration as a C string. The
+     * terminator is deliberately excluded from room_config_length.
+     */
+    server->room_config = calloc(config_length + 1u, 1u);
+    if (server->room_config == NULL) {
+        return -1;
+    }
+    memcpy(server->room_config, config, config_length);
+    server->room_config_length = config_length;
+    return 0;
+}
+
 static int draw_server_init_room_lifecycle(DrawOnlineServer *server)
 {
     pthread_condattr_t attributes;
@@ -2016,6 +2195,15 @@ int draw_online_server_start(
         draw_online_server_destroy(server);
         return -1;
     }
+    if (draw_server_copy_room_config(
+            server,
+            options->room_config,
+            options->room_config_length)
+        != 0) {
+        fprintf(stderr, "draw_online_server_start: room config copy failed\n");
+        draw_online_server_destroy(server);
+        return -1;
+    }
     if (draw_server_load_room(server, options->room_module_path) != 0) {
         const char *loader_error = dlerror();
         fprintf(stderr, "draw_online_server_start: room module load failed: %s\n",
@@ -2027,6 +2215,8 @@ int draw_online_server_start(
     server->room_runtime.server = server;
     server->room_runtime.context.abi_version = DRAW_ROOM_ABI_VERSION;
     server->room_runtime.context.room_id = DRAW_SERVER_ROOM_ID;
+    server->room_runtime.context.config = server->room_config;
+    server->room_runtime.context.config_length = server->room_config_length;
     server->room_runtime.context.userdata = &server->room_runtime;
     server->room_runtime.context.api.wait = draw_server_room_api_wait;
     server->room_runtime.context.api.read = draw_server_room_api_read;
@@ -2182,6 +2372,7 @@ void draw_online_server_destroy(DrawOnlineServer *server)
     if (server->room_module_handle != NULL) {
         (void)dlclose(server->room_module_handle);
     }
+    free(server->room_config);
     if (server->gateway_wakeup_fd >= 0) {
         (void)close(server->gateway_wakeup_fd);
     }

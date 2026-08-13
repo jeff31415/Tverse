@@ -1,35 +1,10 @@
-option(
-    DRAW_CANVAS_TEST_SANITIZERS
-    "Build draw canvas tests with AddressSanitizer and UndefinedBehaviorSanitizer"
-    ON)
+# Sanitizer wiring now lives in cmake/DrawTestSanitizers.cmake so the online
+# tests can use it too. This alias keeps the call sites below unchanged.
+macro(enable_draw_canvas_test_sanitizers target)
+    draw_enable_test_sanitizers("${target}")
+endmacro()
 
 set(DRAW_CANVAS_TEST_TARGETS)
-
-function(enable_draw_canvas_test_sanitizers target)
-    if(NOT DRAW_CANVAS_TEST_SANITIZERS)
-        return()
-    endif()
-
-    if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
-        target_compile_options("${target}" PRIVATE
-            -fsanitize=address,undefined
-            -fno-omit-frame-pointer)
-
-        get_target_property(target_type "${target}" TYPE)
-        if(target_type STREQUAL "EXECUTABLE")
-            # target_link_options() requires CMake 3.13, while this project
-            # currently supports CMake 3.10.
-            set_property(
-                TARGET "${target}"
-                APPEND_STRING
-                PROPERTY LINK_FLAGS " -fsanitize=address,undefined")
-        endif()
-    else()
-        message(WARNING
-            "DRAW_CANVAS_TEST_SANITIZERS is ON, but ${CMAKE_C_COMPILER_ID} "
-            "does not support the configured -fsanitize flags")
-    endif()
-endfunction()
 
 add_library(draw_canvas_unity STATIC unity.c)
 target_include_directories(draw_canvas_unity PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")

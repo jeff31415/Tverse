@@ -24,6 +24,9 @@ int main(void)
     DrawOnlineClientEvent event;
     const uint8_t first_payload[] = {0x00u, 0x10u, 0x20u, 0xffu, 0x7fu};
     const uint8_t second_payload[] = "second-client";
+    const uint8_t config_probe[] = "__config__";
+    /* Deliberately contains an interior NUL: config is bytes, not a string. */
+    const uint8_t room_config[] = {'a', '=', '1', '\n', 0x00u, 'b', '=', '2'};
     uint32_t first_slot = 0u;
     uint32_t repeated_slot = 0u;
     uint32_t rejected_slot = 0u;
@@ -36,6 +39,8 @@ int main(void)
     options.bind_host = "127.0.0.1";
     options.port = 0u;
     options.room_module_path = DRAW_ONLINE_TEST_ROOM_MODULE;
+    options.room_config = room_config;
+    options.room_config_length = sizeof(room_config);
     CHECK_GOTO(draw_online_server_start(&server, &options) == 0);
     port = draw_online_server_port(server);
     CHECK_GOTO(port != 0u);
@@ -67,6 +72,20 @@ int main(void)
     CHECK_GOTO(event.header.player_slot == first_slot);
     CHECK_GOTO(event.payload_length == sizeof(first_payload));
     CHECK_GOTO(memcmp(event.payload, first_payload, sizeof(first_payload)) == 0);
+    draw_online_client_event_release(&event);
+
+    /* The host delivered DrawRoomContext.config byte-exactly, interior NUL
+     * included, and the room can read it. */
+    CHECK_GOTO(draw_online_client_send_game(
+                   first,
+                   1u,
+                   config_probe,
+                   sizeof(config_probe) - 1u,
+                   3000)
+        == 0);
+    CHECK_GOTO(draw_online_client_receive(first, &event, 3000) == 0);
+    CHECK_GOTO(event.payload_length == sizeof(room_config));
+    CHECK_GOTO(memcmp(event.payload, room_config, sizeof(room_config)) == 0);
     draw_online_client_event_release(&event);
 
     CHECK_GOTO(draw_online_client_connect(

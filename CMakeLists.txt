@@ -3,6 +3,9 @@ project(draw_app LANGUAGES C)
 
 include(CTest)
 
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
+include(DrawTestSanitizers)
+
 set(
     BUILD_SHARED_LIBS
     OFF

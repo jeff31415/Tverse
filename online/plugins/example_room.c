@@ -2,6 +2,22 @@
 
 #include <string.h>
 
+/*
+ * A DATA payload equal to this probe is answered with the room's configuration
+ * bytes instead of an echo. It exists so the template demonstrates reading
+ * DrawRoomContext.config, and so tests can assert the host delivered it.
+ */
+#define DRAW_EXAMPLE_ROOM_CONFIG_PROBE "__config__"
+
+static int draw_example_room_is_config_probe(const DrawRoomInput *input)
+{
+    const size_t probe_length = sizeof(DRAW_EXAMPLE_ROOM_CONFIG_PROBE) - 1u;
+
+    return input->payload != NULL && input->payload_length == probe_length
+        && memcmp(input->payload, DRAW_EXAMPLE_ROOM_CONFIG_PROBE, probe_length)
+            == 0;
+}
+
 DRAW_ROOM_EXPORT int server_room_entry(DrawRoomContext *context)
 {
     if (context == NULL || context->abi_version != DRAW_ROOM_ABI_VERSION
@@ -33,8 +49,13 @@ DRAW_ROOM_EXPORT int server_room_entry(DrawRoomContext *context)
             memset(&output, 0, sizeof(output));
             output.recipients = DRAW_ROOM_RECIPIENT_ONE;
             output.player_slot = input.player_slot;
-            output.payload = input.payload;
-            output.payload_length = input.payload_length;
+            if (draw_example_room_is_config_probe(&input)) {
+                output.payload = context->config;
+                output.payload_length = context->config_length;
+            } else {
+                output.payload = input.payload;
+                output.payload_length = input.payload_length;
+            }
             if (context->api.write(context->userdata, &output) != DRAW_ROOM_OK
                 && !context->api.stop_requested(context->userdata)) {
                 return DRAW_ROOM_ERROR;

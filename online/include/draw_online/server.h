@@ -16,6 +16,16 @@ typedef struct DrawOnlineServerOptions {
     const char *room_module_path;
     size_t queue_records;
     size_t queue_bytes;
+    /*
+     * Opaque configuration handed to the room module through
+     * DrawRoomContext.config. The server copies these bytes, so the caller's
+     * buffer need not outlive the call. A null pointer or zero length leaves
+     * the room's config empty. The copy is NUL-terminated one byte past
+     * room_config_length so a room may treat text configuration as a C string
+     * without copying again; that terminator is not counted in the length.
+     */
+    const void *room_config;
+    size_t room_config_length;
 } DrawOnlineServerOptions;
 
 int draw_online_server_start(
