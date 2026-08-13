@@ -384,5 +384,8 @@ without opening a real terminal. It verifies:
 The Canvas JSON/state tests remain separate because those APIs are private
 module logic rather than host/plugin ABI.
 
-See the [minimal example plugin](pages/example.md) for a template and the
-[Canvas page](pages/canvas.md) for a stateful implementation.
+See the [copy-and-rename starter](../example/plugin_templete/README.md) for a
+buildable skeleton with a field-by-field reference, the
+[minimal example plugin](pages/example.md) for the page used by the running
+application, and the [Canvas page](pages/canvas.md) for a stateful
+implementation.

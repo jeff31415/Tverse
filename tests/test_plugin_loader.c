@@ -12,6 +12,9 @@
 #ifndef TEST_CANVAS_PLUGIN_PATH
 #error "TEST_CANVAS_PLUGIN_PATH must name the Canvas plugin module"
 #endif
+#ifndef TEST_TEMPLETE_PLUGIN_PATH
+#error "TEST_TEMPLETE_PLUGIN_PATH must name the starter template module"
+#endif
 
 typedef struct FakeStdin {
     const unsigned char *bytes;
@@ -290,10 +293,113 @@ static void test_canvas_plugin_uses_the_same_abi(void)
     draw_plugin_module_close(&module);
 }
 
+static void test_plugin_templete_is_a_complete_loadable_module(void)
+{
+    static const unsigned char raw_input[] = {'r', 'a', 'w'};
+    static const char title[] = "Starter test";
+    FakeStdin input = {
+        .bytes = raw_input,
+        .length = sizeof(raw_input),
+    };
+    DrawPluginOpenArgs args = {
+        .abi_version = DRAW_PLUGIN_ABI_VERSION,
+        .frame_size = {60, 12},
+        .config = {
+            .data = (const uint8_t *)title,
+            .len = sizeof(title) - 1u,
+        },
+        .host = {
+            .userdata = &input,
+            .stdin_read = fake_stdin_read,
+        },
+    };
+
+    DrawPluginModule module;
+    args.abi_version = DRAW_PLUGIN_ABI_VERSION + 1u;
+    TEST_ASSERT_EQUAL_INT(
+        TG_ERR_UNSUPPORTED,
+        draw_plugin_module_open(
+            TEST_TEMPLETE_PLUGIN_PATH,
+            &args,
+            &module));
+    TEST_ASSERT_NULL(module.handle);
+    TEST_ASSERT_NULL(module.instance);
+
+    args.abi_version = DRAW_PLUGIN_ABI_VERSION;
+    TEST_ASSERT_EQUAL_INT(
+        TG_OK,
+        draw_plugin_module_open(
+            TEST_TEMPLETE_PLUGIN_PATH,
+            &args,
+            &module));
+
+    TEST_ASSERT_EQUAL_INT(
+        TG_OK,
+        module.functions.write(
+            module.instance,
+            DRAW_PLUGIN_WRITE_ENTER,
+            NULL));
+
+    TuiInputEvent event;
+    memset(&event, 0, sizeof(event));
+    event.type = TUI_INPUT_TEXT;
+    event.ch = 'T';
+    TEST_ASSERT_EQUAL_INT(
+        TG_OK,
+        module.functions.write(
+            module.instance,
+            DRAW_PLUGIN_WRITE_INPUT,
+            &event));
+
+    DrawPluginFrameContext context = {
+        .frame_index = 11,
+        .delta_time = 1.0 / 30.0,
+        .frame_size = args.frame_size,
+    };
+    TEST_ASSERT_EQUAL_INT(
+        TG_OK,
+        module.functions.write(
+            module.instance,
+            DRAW_PLUGIN_WRITE_TICK,
+            &context));
+    TEST_ASSERT_EQUAL_size_t(1, input.calls);
+    TEST_ASSERT_EQUAL_size_t(sizeof(raw_input), input.offset);
+
+    size_t cell_count =
+        (size_t)args.frame_size.w * (size_t)args.frame_size.h;
+    TuiCell *cells = calloc(cell_count, sizeof(*cells));
+    TEST_ASSERT_NOT_NULL(cells);
+    DrawPluginSurface surface = {
+        .size = args.frame_size,
+        .cells = cells,
+    };
+    TEST_ASSERT_EQUAL_INT(
+        TG_OK,
+        module.functions.read(
+            module.instance,
+            DRAW_PLUGIN_READ_FRAME,
+            &surface));
+    TEST_ASSERT_TRUE(surface_contains(&surface, title));
+    TEST_ASSERT_TRUE(surface_contains(&surface, "frame=11"));
+    TEST_ASSERT_TRUE(surface_contains(&surface, "raw-bytes=3"));
+    TEST_ASSERT_TRUE(surface_contains(&surface, "ch=84"));
+    free(cells);
+
+    DrawPluginLeaveReason reason = DRAW_PLUGIN_LEAVE_SHUTDOWN;
+    TEST_ASSERT_EQUAL_INT(
+        TG_OK,
+        module.functions.write(
+            module.instance,
+            DRAW_PLUGIN_WRITE_LEAVE,
+            &reason));
+    draw_plugin_module_close(&module);
+}
+
 int main(void)
 {
     UNITY_BEGIN();
     RUN_TEST(test_example_plugin_full_abi_and_generation_cleanup);
     RUN_TEST(test_canvas_plugin_uses_the_same_abi);
+    RUN_TEST(test_plugin_templete_is_a_complete_loadable_module);
     return UNITY_END();
 }

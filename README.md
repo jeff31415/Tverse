@@ -35,9 +35,11 @@ Run the application with:
 The build places page modules under `build/plugins`. Press `Ctrl+R` to reload
 the active page immediately; changed module files are also detected between
 frames. [`examples/minimal_page_plugin`](examples/minimal_page_plugin/) is the
-small standalone template for a new page. The complete Canvas implementation
-lives under [`plugins/canvas`](plugins/canvas/); the repository root retains
-only host code and shared plugin infrastructure.
+small example used by the running application. The copy-and-rename
+[`example/plugin_templete`](example/plugin_templete/) starter includes all ABI
+functions, a standalone CMake template and a field-by-field ABI guide. The
+complete Canvas implementation lives under [`plugins/canvas`](plugins/canvas/);
+the repository root retains only host code and shared plugin infrastructure.
 
 See [`docs/README.md`](docs/README.md) for the architecture, controls and
 source guide. The current plugin contract is documented separately in

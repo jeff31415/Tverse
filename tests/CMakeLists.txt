@@ -134,6 +134,7 @@ set_tests_properties(draw_canvas_test_history_cycle_destroy PROPERTIES
 add_executable(draw_plugin_loader_test test_plugin_loader.c)
 target_compile_definitions(draw_plugin_loader_test PRIVATE
     TEST_PLUGIN_PATH="$<TARGET_FILE:draw_page_example>"
+    TEST_TEMPLETE_PLUGIN_PATH="$<TARGET_FILE:draw_page_plugin_templete>"
     TEST_CANVAS_PLUGIN_PATH="$<TARGET_FILE:draw_page_canvas>")
 target_link_libraries(draw_plugin_loader_test PRIVATE
     draw_app_warnings
@@ -145,6 +146,7 @@ set_target_properties(draw_plugin_loader_test PROPERTIES
 add_dependencies(
     draw_plugin_loader_test
     draw_page_example
+    draw_page_plugin_templete
     draw_page_canvas)
 add_test(NAME draw_plugin_loader_test COMMAND draw_plugin_loader_test)
 set_tests_properties(draw_plugin_loader_test PROPERTIES

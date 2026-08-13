@@ -13,6 +13,7 @@ example plugin serving as the other-page template.
 | [Application lifecycle](application-lifecycle.md) | Initialization, frame dispatch, page switching, hot reload and shutdown sequence diagrams |
 | [`dlfcn` page plugin design](plugin-hot-reload-plan.md) | Design rationale, build split and remaining hardening work |
 | [Minimal example page](pages/example.md) | Template state, config bytes, four entry points, stdin callback and complete example sequence |
+| [Plugin starter template](../example/plugin_templete/README.md) | Copyable source/CMake template plus every ABI structure, function, read tag and write tag |
 | [Reusable canvas state](canvas-state.md) | Page-independent stroke lifecycle, history ownership, projection, rendering and reuse contract |
 | [Canvas page](pages/canvas.md) | Canvas ABI mapping, instance ownership, lifecycle sequence, input, history, JSON and rendering |
 | [Online subsystem](online.md) | Implemented wire format, Gateway/Auth/Lobby/room ownership, queue and room ABI contracts, demo API, lifecycle and integration tests |
@@ -102,7 +103,10 @@ shortcuts:
   [`canvas_page.c`](../plugins/canvas/canvas_page.c): Canvas ABI entry points,
   input, layout, palette and page chrome.
 - [`examples/minimal_page_plugin`](../examples/minimal_page_plugin/): smallest
-  standalone page module and template.
+  page module used by the application.
+- [`example/plugin_templete`](../example/plugin_templete/): buildable
+  copy-and-rename starter with all four functions, operation examples and
+  local CMake template.
 - [`pages.c`](../pages.c): host page metadata, module paths and config bytes.
 - [`tests`](../tests/): document, JSON, state, rendering and dynamic-loader
   tests.

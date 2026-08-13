@@ -1,8 +1,11 @@
 # Minimal example page plugin
 
 [`example_page.c`](../../examples/minimal_page_plugin/example_page.c) is the
-smallest complete page implementation and the recommended starting point for a
-new plugin. It depends on [`plugin.h`](../../plugin.h) and the shared
+smallest complete page used by the running application. For a copy-and-rename
+starting point, use the dedicated
+[`example/plugin_templete`](../../example/plugin_templete/) directory, which
+also documents every ABI structure and operation. The runtime example depends
+on [`plugin.h`](../../plugin.h) and the shared
 [`plugin_frame.h`](../../plugin_frame.h) helpers, but deliberately does not
 include `app.h` or call global TUI functions.
 
@@ -134,7 +137,7 @@ sequenceDiagram
 
 ## Using it as a template
 
-1. Copy `examples/minimal_page_plugin` to a page-specific directory.
+1. Copy `example/plugin_templete` to a page-specific directory.
 2. Rename the CMake target and `OUTPUT_NAME` so it produces a distinct `.so`.
 3. Replace `ExamplePage` with the page's private state.
 4. Define the config byte layout and validate it in entry.
