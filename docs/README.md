@@ -15,6 +15,7 @@ example plugin serving as the other-page template.
 | [Minimal example page](pages/example.md) | Template state, config bytes, four entry points, stdin callback and complete example sequence |
 | [Reusable canvas state](canvas-state.md) | Page-independent stroke lifecycle, history ownership, projection, rendering and reuse contract |
 | [Canvas page](pages/canvas.md) | Canvas ABI mapping, instance ownership, lifecycle sequence, input, history, JSON and rendering |
+| [Online subsystem](online.md) | Implemented wire format, Gateway/Auth/Lobby/room ownership, queue and room ABI contracts, demo API, lifecycle and integration tests |
 
 The original Canvas design material is under
 [`design_drafts/canvas`](../design_drafts/canvas/).
@@ -105,6 +106,9 @@ shortcuts:
 - [`pages.c`](../pages.c): host page metadata, module paths and config bytes.
 - [`tests`](../tests/): document, JSON, state, rendering and dynamic-loader
   tests.
+- [`online`](../online/): minimal server/client subsystem, public wire and room
+  headers, Gateway runtime, dynamic echo room, demo executables and online
+  tests. See [`online.md`](online.md) for its implementation contract.
 - [`draw_app.conf.example`](../draw_app.conf.example): complete optional
   configuration example.
 

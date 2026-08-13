@@ -5,6 +5,9 @@ This directory is the first executable slice of the server/client plan in
 It deliberately implements one complete path before the remaining reload and
 recovery state machines.
 
+See [`docs/online.md`](../docs/online.md) for the implemented wire, queue,
+thread-ownership, room ABI, server/client API, and shutdown contracts.
+
 ## Implemented slice
 
 - fixed-offset 64-byte, big-endian wire codec;
